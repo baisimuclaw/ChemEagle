@@ -6,15 +6,19 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
 
 import main
 import get_molecular_agent
+import get_R_group_sub_agent
 import get_reaction_agent
 import get_text_agent
+from chemeagle_llm import LLMResponse, backend_scope
 from chemietoolkit import helper as chemistry_helper
+from molnextr import chemistry as molnextr_chemistry
 from chemeagle_vision.request_cache import (
     caching_molecular_tool,
     compact_vision_tool_value,
@@ -129,6 +133,39 @@ class ImportAndOrchestrationTests(unittest.TestCase):
 
         predict.assert_called_once()
 
+    def test_reaction_condition_ocr_configures_tesseract_before_use(self):
+        opened_image = object()
+        events = []
+
+        with (
+            mock.patch.object(
+                get_text_agent,
+                "configure_tesseract",
+                side_effect=lambda: events.append("configure"),
+            ) as configure,
+            mock.patch.object(
+                get_reaction_agent.Image,
+                "open",
+                side_effect=lambda _path: (
+                    events.append("open"),
+                    opened_image,
+                )[1],
+            ),
+            mock.patch(
+                "pytesseract.image_to_string",
+                side_effect=lambda image: (
+                    events.append("ocr"),
+                    "Mn(CO)5Br, toluene, reflux",
+                )[1],
+            ) as image_to_string,
+        ):
+            result = get_reaction_agent._tesseract_ocr_image("scheme.png")
+
+        self.assertEqual(result, "Mn(CO)5Br, toluene, reflux")
+        self.assertEqual(events, ["configure", "open", "ocr"])
+        configure.assert_called_once_with()
+        image_to_string.assert_called_once_with(opened_image)
+
     def test_molecular_prediction_retries_empty_detections_then_succeeds(self):
         raw = [{"bboxes": [{"smiles": "C"}], "corefs": []}]
         converted_image = object()
@@ -178,6 +215,38 @@ class ImportAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(result, "CC")
         self.assertEqual(observed["name"], "ethane")
         self.assertFalse(observed["path"].parent.exists())
+
+    def test_successful_llm_symbol_conversion_is_cached_per_request(self):
+        class SymbolBackend:
+            provider_name = "codex"
+            config = types.SimpleNamespace(model="test-model")
+
+            def __init__(self):
+                self.calls = 0
+
+            def generate(self, _request):
+                self.calls += 1
+                return LLMResponse(content='{"smiles": "[CH3]"}')
+
+        backend = SymbolBackend()
+        with backend_scope(backend):
+            self.assertEqual(
+                molnextr_chemistry._llm_symbol_to_smiles("unusual-group"),
+                "[CH3]",
+            )
+            self.assertEqual(
+                molnextr_chemistry._llm_symbol_to_smiles("unusual-group"),
+                "[CH3]",
+            )
+        self.assertEqual(backend.calls, 1)
+
+        # A new top-level request must not inherit chemistry from the old one.
+        with backend_scope(backend):
+            self.assertEqual(
+                molnextr_chemistry._llm_symbol_to_smiles("unusual-group"),
+                "[CH3]",
+            )
+        self.assertEqual(backend.calls, 2)
 
     def test_molecular_tool_reuses_raw_prediction_without_stripping_graph(self):
         raw = [
@@ -272,6 +341,26 @@ class ImportAndOrchestrationTests(unittest.TestCase):
             [[0.1, 0.2]],
         )
 
+    def test_final_and_text_synthesis_receive_compact_agent_results(self):
+        source = (ROOT / "main.py").read_text(encoding="utf-8")
+        function_source = next(
+            ast.get_source_segment(source, node)
+            for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_chemeagle_cloud_impl"
+        )
+
+        self.assertIn(
+            "agent_name: compact_vision_tool_value(agent_result)",
+            function_source,
+        )
+        self.assertGreaterEqual(
+            function_source.count(
+                "graphical_input=compact_vision_tool_value(main_area_result)"
+            ),
+            2,
+        )
+
     def test_all_molecular_agent_variants_use_request_scoped_raw_cache(self):
         source = (ROOT / "get_molecular_agent.py").read_text(encoding="utf-8")
         functions = {
@@ -314,6 +403,77 @@ class ImportAndOrchestrationTests(unittest.TestCase):
                 )
                 self.assertIn('"reaction_prediction": raw_prediction', function_source)
                 self.assertNotIn("model1.predict_image_file", function_source)
+
+    def test_product_variant_agent_handles_empty_reaction_prediction(self):
+        molecular = [
+            {
+                "bboxes": [
+                    {
+                        "category": "[Mol]",
+                        "smiles": "CC",
+                        "bbox": [0, 0, 1, 1],
+                        "coords": [[0.0, 0.0]],
+                        "edges": [[0]],
+                    }
+                ],
+                "corefs": [],
+            }
+        ]
+        agent_output = {"CC": ["4", "no reaction", "reactant template"]}
+
+        with (
+            tempfile.NamedTemporaryFile(suffix=".png") as image_file,
+            mock.patch.object(
+                get_R_group_sub_agent,
+                "get_active_backend",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                get_R_group_sub_agent,
+                "_run_image_tool_agent_with_results",
+                return_value=(agent_output, [], {}),
+            ),
+            mock.patch.object(
+                get_R_group_sub_agent,
+                "_compensate_missing_molecules",
+                side_effect=lambda value, *_args: value,
+            ),
+            mock.patch.object(
+                get_R_group_sub_agent,
+                "get_cached_multi_molecular",
+                return_value=molecular,
+            ),
+            mock.patch.object(
+                get_R_group_sub_agent,
+                "get_cached_raw_results",
+                return_value=[],
+            ),
+            mock.patch.object(get_R_group_sub_agent.Image, "open") as open_image,
+            mock.patch.object(
+                get_R_group_sub_agent.utils,
+                "backout_without_coref",
+                return_value=[],
+            ),
+            mock.patch.object(
+                get_R_group_sub_agent,
+                "normalize_product_variant_output",
+                side_effect=lambda value: value,
+            ),
+        ):
+            open_image.return_value.convert.return_value = object()
+            result = (
+                get_R_group_sub_agent
+                .process_reaction_image_with_product_variant_R_group(
+                    image_file.name
+                )
+            )
+
+        self.assertEqual(
+            result["reaction_template"],
+            {"reactants": [], "products": []},
+        )
+        self.assertEqual(result["reactions"], {})
+        self.assertEqual(result["original_molecule_list"], agent_output)
 
     def test_import_main_without_api_environment_or_heavy_models(self):
         env = dict(os.environ)

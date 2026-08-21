@@ -2,7 +2,13 @@
 
 from .base import BaseLLMBackend, LLMBackend, bind_image_tools, parse_json_content
 from .config import BackendConfig
-from .context import backend_model, backend_scope, get_active_backend, peek_active_backend
+from .context import (
+    backend_model,
+    backend_scope,
+    get_active_backend,
+    get_request_cache,
+    peek_active_backend,
+)
 from .errors import (
     AuthenticationError,
     BackendConfigurationError,
@@ -40,6 +46,7 @@ __all__ = [
     "bind_image_tools",
     "create_backend",
     "get_active_backend",
+    "get_request_cache",
     "parse_json_content",
     "peek_active_backend",
 ]

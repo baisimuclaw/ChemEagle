@@ -562,6 +562,13 @@ def _get_extra_body(model_name: str) -> dict:
 
 def _tesseract_ocr_image(image_path: str) -> str:
     import pytesseract
+    # Reuse the same executable discovery used by the text agent.  This is
+    # especially important when the orchestrator's conda environment contains
+    # Tesseract but that environment's bin directory is not inherited by the
+    # process launching this condition tool.
+    from get_text_agent import configure_tesseract
+
+    configure_tesseract()
     img = Image.open(image_path)
     raw_text = pytesseract.image_to_string(img)
     return raw_text

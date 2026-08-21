@@ -15,6 +15,7 @@ from chemeagle_vision import (
     create_vision_backend,
     vision_scope,
 )
+from chemeagle_vision.request_cache import compact_vision_tool_value
 
 def _normalize_agent_args(raw_args: Optional[dict], image_path: str) -> dict:
     if not isinstance(raw_args, dict):
@@ -284,7 +285,7 @@ def _chemeagle_cloud_impl(
             'role': 'tool',
             'content': json.dumps({
                 'image_path': image_path,
-                agent_name: agent_result,
+                agent_name: compact_vision_tool_value(agent_result),
             }),
             'tool_call_id': f"agent_call_{idx}",
         })
@@ -303,13 +304,14 @@ def _chemeagle_cloud_impl(
         try:
             text_extraction_result = text_extraction_agent(
                 image_path=image_path,
-                graphical_input=main_area_result,
+                graphical_input=compact_vision_tool_value(main_area_result),
             )
             if use_action_observer and text_extraction_result is not None:
                 text_extraction_result = _observe_and_retry(
                     "text_extraction_agent", text_extraction_result,
                     lambda: text_extraction_agent(
-                        image_path=image_path, graphical_input=main_area_result))
+                        image_path=image_path,
+                        graphical_input=compact_vision_tool_value(main_area_result)))
         except Exception as exc:
 
             failed_agents.append(f"text_extraction_agent: {type(exc).__name__}: {exc}")

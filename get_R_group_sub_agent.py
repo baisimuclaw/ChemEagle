@@ -1165,7 +1165,7 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
  
     #coref_results = model.extract_molecule_corefs_from_figures([image_np])
     #coref_results = process_reaction_image_with_multiple_products_and_text_correctR(image_path)
-    #coref_results = get_cached_multi_molecular(image_path)
+    coref_results = get_cached_multi_molecular(image_path)
 
 
     # reaction_results = model.extract_reactions_from_figures([image_np])

@@ -26,6 +26,7 @@ from chemeagle_llm import (
     LLMRequest,
     backend_model,
     create_backend,
+    get_request_cache,
     parse_json_content,
     peek_active_backend,
 )
@@ -372,6 +373,12 @@ def _llm_symbol_to_smiles(symbol: str,
             )
         )
         owns_backend = True
+
+    selected_model = backend_model(backend, model)
+    request_cache = get_request_cache("llm_symbol_to_smiles")
+    cache_key = (symbol, selected_model)
+    if request_cache is not None and cache_key in request_cache:
+        return request_cache[cache_key]
     
     try:
         # Load the prompt template
@@ -381,7 +388,7 @@ def _llm_symbol_to_smiles(symbol: str,
         prompt = prompt_template.format(symbol=symbol)
 
         response = backend.generate(LLMRequest(
-            model=backend_model(backend, model),
+            model=selected_model,
             messages=[
                 {"role": "system", "content": "You are a professional cheminformatics assistant specialized in converting chemical symbols to SMILES format."},
                 {"role": "user", "content": prompt}
@@ -406,6 +413,8 @@ def _llm_symbol_to_smiles(symbol: str,
             try:
                 mol = Chem.MolFromSmiles(smiles)
                 if mol is not None:
+                    if request_cache is not None:
+                        request_cache[cache_key] = smiles
                     return smiles
             except Exception:
                 pass

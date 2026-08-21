@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Iterator, Optional
+from typing import Any, Dict, Hashable, Iterator, MutableMapping, Optional
 
 from .base import LLMBackend
 from .factory import create_backend
@@ -13,15 +13,36 @@ from .factory import create_backend
 _ACTIVE_BACKEND: ContextVar[Optional[LLMBackend]] = ContextVar(
     "chemeagle_active_llm_backend", default=None
 )
+_REQUEST_CACHES: ContextVar[Optional[Dict[str, Dict[Hashable, Any]]]] = ContextVar(
+    "chemeagle_request_caches", default=None
+)
 
 
 @contextmanager
 def backend_scope(backend: LLMBackend) -> Iterator[LLMBackend]:
-    token = _ACTIVE_BACKEND.set(backend)
+    backend_token = _ACTIVE_BACKEND.set(backend)
+    cache_token = _REQUEST_CACHES.set({})
     try:
         yield backend
     finally:
-        _ACTIVE_BACKEND.reset(token)
+        _REQUEST_CACHES.reset(cache_token)
+        _ACTIVE_BACKEND.reset(backend_token)
+
+
+def get_request_cache(
+    namespace: str,
+) -> Optional[MutableMapping[Hashable, Any]]:
+    """Return a cache isolated to the current top-level backend request.
+
+    Standalone helpers that run outside :func:`backend_scope` deliberately get
+    no cache.  Context copies used by dynamic-tool worker threads retain the
+    same underlying dictionaries, so nested agents can reuse deterministic
+    results without leaking them into later ChemEAGLE requests.
+    """
+    caches = _REQUEST_CACHES.get()
+    if caches is None:
+        return None
+    return caches.setdefault(namespace, {})
 
 
 def peek_active_backend() -> Optional[LLMBackend]:
