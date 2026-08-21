@@ -41,6 +41,7 @@ class VisionConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.provider, "slurm-ssh")
         self.assertEqual(config.device, "cuda")
+        self.assertEqual(config.chemrxn_device, "cpu")
         self.assertTrue(config.offline)
         self.assertEqual(config.slurm_account, "xlzhang")
         self.assertEqual(config.slurm_submit_host, "sandbox")
@@ -78,6 +79,7 @@ class VisionConfigTests(unittest.TestCase):
         self.assertIn("--gres=gpu:L40S:1", remote)
         self.assertIn("PYTHONNOUSERSITE=1", remote)
         self.assertIn("CHEMEAGLE_OFFLINE=1", remote)
+        self.assertIn("--chemrxn-device cpu", remote)
         self.assertIn("chemeagle_vision.worker", remote)
         self.assertNotIn("OPENAI", remote)
 
@@ -210,6 +212,7 @@ class WorkerProtocolTests(unittest.TestCase):
         class FakeToolkit:
             def __init__(self, **kwargs):
                 instances.append(self)
+                self.kwargs = kwargs
                 self.rxnim = FakeComponent()
                 self.molnextr = FakeComponent()
                 self.chemner = FakeComponent()
@@ -234,6 +237,7 @@ class WorkerProtocolTests(unittest.TestCase):
                 "chemrxn_extract_sentences", {"sentences": ["EtOH reacted."]}
             )
         self.assertEqual(len(instances), 1)
+        self.assertEqual(instances[0].kwargs["chemrxn_device"], "cpu")
 
 
 class ApplicationVisionLifecycleTests(unittest.TestCase):

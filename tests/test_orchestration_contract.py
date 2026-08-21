@@ -8,6 +8,8 @@ import unittest
 from unittest import mock
 
 import main
+import get_reaction_agent
+import get_text_agent
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +31,53 @@ class _FakeBackend:
 
 
 class ImportAndOrchestrationTests(unittest.TestCase):
+    def test_text_models_receive_only_sentence_like_prose(self):
+        ocr = (
+            "DBU (1.1 equiv) benzene reflux 2 h\n"
+            "6a: Ar = Ph; 61%, E/Z = 90:10\n"
+            "Scheme 1. The hydrophosphination reaction gives phosphorus ylides."
+        )
+        self.assertEqual(
+            get_text_agent.filter_prose_sentences(ocr),
+            ["The hydrophosphination reaction gives phosphorus ylides."],
+        )
+        self.assertEqual(
+            get_text_agent.filter_prose_sentences("DBU (1.1 equiv)\n4 80%"),
+            [],
+        )
+        with mock.patch.dict(
+            os.environ, {"CHEMEAGLE_TEXT_PROSE_FILTER": "0"}, clear=False
+        ):
+            self.assertEqual(
+                get_text_agent._text_model_sentences("DBU reagent."),
+                ["DBU reagent."],
+            )
+
+    def test_reaction_tool_reuses_raw_prediction_and_handles_no_detection(self):
+        self.assertEqual(get_reaction_agent._reaction_summary_from_raw([]), {})
+        raw = [
+            {
+                "reactants": [
+                    {"smiles": "C", "bbox": [0, 0, 1, 1], "symbols": ["C"]}
+                ],
+                "conditions": [],
+                "products": [],
+            }
+        ]
+        cache = {}
+        with mock.patch.object(
+            get_reaction_agent.model1,
+            "predict_image_file",
+            return_value=raw,
+        ) as predict:
+            tool = get_reaction_agent._caching_reaction_tool(cache)
+            summary = tool("input.png")
+            cached_summary = tool("input.png")
+        predict.assert_called_once()
+        self.assertIs(cache["raw_prediction"], raw)
+        self.assertEqual(summary["reactants"][0]["smiles"], "C")
+        self.assertEqual(cached_summary, summary)
+
     def test_import_main_without_api_environment_or_heavy_models(self):
         env = dict(os.environ)
         for name in (

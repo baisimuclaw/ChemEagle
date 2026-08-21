@@ -26,6 +26,7 @@ def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
 class VisionConfig:
     provider: str = "local"
     device: str = "auto"
+    chemrxn_device: str = "cpu"
     timeout: float = 600.0
     startup_timeout: float = 1800.0
     offline: bool = False
@@ -71,6 +72,9 @@ class VisionConfig:
         defaults = dict(
             provider=selected,
             device=values.get("CHEMEAGLE_VISION_DEVICE", "cuda" if remote else "auto"),
+            chemrxn_device=values.get(
+                "CHEMEAGLE_VISION_CHEMRXN_DEVICE", "cpu"
+            ).strip().lower(),
             timeout=float(values.get("CHEMEAGLE_VISION_TIMEOUT", "600")),
             startup_timeout=float(
                 values.get("CHEMEAGLE_VISION_STARTUP_TIMEOUT", "1800")
@@ -107,6 +111,10 @@ class VisionConfig:
         return cls(**defaults)
 
     def validate_remote(self) -> None:
+        if self.chemrxn_device not in {"cpu", "cuda", "auto"}:
+            raise ValueError(
+                "CHEMEAGLE_VISION_CHEMRXN_DEVICE must be one of: cpu, cuda, auto"
+            )
         if self.provider == "local":
             return
         if not self.ssh_host:

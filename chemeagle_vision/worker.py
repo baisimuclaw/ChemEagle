@@ -55,6 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ChemEAGLE offline vision worker")
     parser.add_argument("--stdio", action="store_true", help="serve JSONL over stdio")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--chemrxn-device",
+        choices=("cpu", "cuda", "auto"),
+        default="cpu",
+        help="device for ChemRxnExtractor; upstream uses CPU",
+    )
     parser.add_argument("--model-dir")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--health", action="store_true")
@@ -66,6 +72,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     config = VisionConfig(
         provider="local",
         device=args.device,
+        chemrxn_device=args.chemrxn_device,
         model_dir=args.model_dir,
         offline=args.offline,
     )

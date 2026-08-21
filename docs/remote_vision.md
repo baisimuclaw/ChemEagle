@@ -90,6 +90,7 @@ export CHEMEAGLE_VISION_REMOTE_DIR=/REMOTE/PATH/ChemEagle
 export CHEMEAGLE_VISION_REMOTE_PYTHON=/REMOTE/PATH/env/bin/python
 export CHEMEAGLE_VISION_MODEL_DIR=/REMOTE/PATH/chemeagle-models
 export CHEMEAGLE_VISION_DEVICE=cuda
+export CHEMEAGLE_VISION_CHEMRXN_DEVICE=cpu
 export CHEMEAGLE_VISION_OFFLINE=true
 ```
 
@@ -112,6 +113,7 @@ export CHEMEAGLE_VISION_REMOTE_DIR=/SHARED/PATH/ChemEagle
 export CHEMEAGLE_VISION_REMOTE_PYTHON=/SHARED/PATH/env/bin/python
 export CHEMEAGLE_VISION_MODEL_DIR=/SHARED/PATH/chemeagle-models
 export CHEMEAGLE_VISION_DEVICE=cuda
+export CHEMEAGLE_VISION_CHEMRXN_DEVICE=cpu
 export CHEMEAGLE_VISION_OFFLINE=true
 
 export CHEMEAGLE_VISION_SLURM_ACCOUNT=xlzhang
@@ -194,6 +196,13 @@ finally:
 
 One worker serializes requests, appropriate for one 8 GB 3060 Ti. For L40S batch
 parallelism, start several workers with separate Slurm GPU allocations.
+
+ChemRxnExtractor defaults to CPU, matching the upstream text agent and avoiding
+contention with the PyTorch vision models already resident on the GPU. Set
+`CHEMEAGLE_VISION_CHEMRXN_DEVICE=cuda` only after validating that combination on
+the target environment. Scheme-only OCR is filtered before ChemNER and
+ChemRxnExtractor by default; set `CHEMEAGLE_TEXT_PROSE_FILTER=0` on the workstation
+to restore the upstream all-text behaviour.
 
 ## Common failures
 

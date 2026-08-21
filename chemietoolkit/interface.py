@@ -14,11 +14,23 @@ from .tableextractor import TableExtractor
 from .utils import *
 
 class ChemIEToolkit:
-    def __init__(self, device=None, model_dir=None, offline=False):
+    def __init__(
+        self,
+        device=None,
+        model_dir=None,
+        offline=False,
+        chemrxn_device="cpu",
+    ):
         if device is None:
             self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
         else:
             self.device = torch.device(device)
+
+        if chemrxn_device == "auto":
+            chemrxn_device = self.device.type
+        if chemrxn_device not in {"cpu", "cuda"}:
+            raise ValueError("chemrxn_device must be one of: cpu, cuda, auto")
+        self.chemrxn_device = chemrxn_device
 
         self.model_dir = (
             os.path.abspath(os.path.expanduser(model_dir)) if model_dir else None
@@ -205,7 +217,9 @@ class ChemIEToolkit:
             ckpt_path = snapshot_download(
                 repo_id="amberwang/chemrxnextractor-training-modules"
             )
-        self._chemrxnextractor = ChemRxnExtractor("", None, ckpt_path, self.device.type)
+        self._chemrxnextractor = ChemRxnExtractor(
+            "", None, ckpt_path, self.chemrxn_device
+        )
 
     def extract_reactions_from_strings(self, strings):
         return self.chemrxnextractor.rxn_extractor.get_reactions(strings)

@@ -54,6 +54,8 @@ class RemoteVisionBackend:
             "--stdio",
             "--device",
             self.config.device,
+            "--chemrxn-device",
+            self.config.chemrxn_device,
         ]
         if self.config.offline:
             argv.append("--offline")

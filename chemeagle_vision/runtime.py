@@ -58,6 +58,7 @@ class VisionRuntime:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
             self._toolkit = ChemIEToolkit(
                 device=device,
+                chemrxn_device=self.config.chemrxn_device,
                 model_dir=self.config.model_dir,
                 offline=self.config.offline,
             )

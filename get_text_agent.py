@@ -14,6 +14,7 @@ import os
 import shutil
 import re
 import sys
+from functools import lru_cache
 from chemeagle_vision.proxies import (
     vision_chemner as model2,
     vision_chemrxnextractor as rxn_extractor,
@@ -139,6 +140,45 @@ def split_text_into_sentences(text: str) -> list:
     return result
 
 
+def filter_prose_sentences(text: str) -> list:
+    """Keep sentence-like prose and discard scheme labels/conditions.
+
+    ChemRxnExtractor is trained for natural-language reaction descriptions, not
+    OCR fragments such as ``DBU (1.1 equiv)`` or table rows. Feeding an entire
+    scheme's labels to the large text models is both slow and uninformative.
+    """
+    prose = []
+    for sentence in split_text_into_sentences(text):
+        words = re.findall(r"[A-Za-z][A-Za-z'-]*", sentence)
+        looks_like_scheme_data = re.search(
+            r"(?:=|%|[\[\]{}~+]|\bequiv\b|\bE/Z\b|\bF/Z\b)",
+            sentence,
+            re.IGNORECASE,
+        )
+        if (
+            len(words) >= 5
+            and re.search(r"[.!?](?:\s|$)", sentence)
+            and not looks_like_scheme_data
+        ):
+            prose.append(sentence)
+    return prose
+
+
+def _text_model_sentences(text: str) -> list:
+    """Select text-model input, with an escape hatch for upstream behaviour."""
+    enabled = os.environ.get("CHEMEAGLE_TEXT_PROSE_FILTER", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return split_text_into_sentences(text)
+    return filter_prose_sentences(text)
+
+
+@lru_cache(maxsize=128)
+def _ocr_image_text(image_path: str) -> str:
+    configure_tesseract()
+    with Image.open(image_path) as img:
+        return pytesseract.image_to_string(img)
+
+
 def extract_reactions_from_text_in_image(image_path: str) -> dict:
     """
     Extract text from a chemical reaction image and identify reactions.
@@ -153,18 +193,18 @@ def extract_reactions_from_text_in_image(image_path: str) -> dict:
         'reactions': reaction list output by RxnExtractor (list)
       }
     """
-    configure_tesseract()
-
     # 1. OCR text extraction
-    img = Image.open(image_path)
-    raw_text = pytesseract.image_to_string(img)
+    raw_text = _ocr_image_text(os.path.abspath(image_path))
 
     # 2. Merge multi-line text into a single paragraph
     lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
     paragraph = " ".join(lines)
 
     # 3. Split text into sentences to avoid length issues
-    sentences = split_text_into_sentences(paragraph)
+    sentences = _text_model_sentences(paragraph)
+    if not sentences:
+        print("[Text extraction] No sentence-like prose; skipping ChemRxnExtractor")
+        return []
     
     # 4. Extract reactions for each sentence on the active vision worker.
     all_reactions = []
@@ -186,18 +226,19 @@ def extract_reactions_from_text_in_image(image_path: str) -> dict:
     return all_reactions 
 
 def NER_from_text_in_image(image_path: str) -> dict:
-    configure_tesseract()
-
     # 1. OCR text extraction
-    img = Image.open(image_path)
-    raw_text = pytesseract.image_to_string(img)
+    raw_text = _ocr_image_text(os.path.abspath(image_path))
 
     # 2. Merge multi-line text into a single paragraph
     lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
     paragraph = " ".join(lines)
+    prose = _text_model_sentences(paragraph)
+    if not prose:
+        print("[Text extraction] No sentence-like prose; skipping ChemNER")
+        return []
 
     # 3. Extract named entities on the active vision worker.
-    predictions = model2.predict_strings([paragraph])
+    predictions = model2.predict_strings([" ".join(prose)])
 
     return predictions 
 

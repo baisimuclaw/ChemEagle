@@ -49,19 +49,10 @@ def _run_image_tool_agent(
     return parse_json_content(response)
 
 
-def get_reaction(image_path: str) -> dict:
-    '''
-    Returns a structured dictionary of reactions extracted from the image,
-    including reactants, conditions, and products, with their smiles, text, and bbox.
-    '''
-    image_file = image_path
-    image = Image.open(image_file)
-
-    image_file = image_path
-    raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
-    #print(f'raw_prediction:{raw_prediction}')
-
-    # Ensure raw_prediction is treated as a list directly
+def _reaction_summary_from_raw(raw_prediction) -> dict:
+    """Build the compact tool payload while retaining raw results for callers."""
+    if not raw_prediction:
+        return {}
     structured_output = {}
     for section_key in ['reactants', 'conditions', 'products']:
         if section_key in raw_prediction[0]:
@@ -83,9 +74,28 @@ def get_reaction(image_path: str) -> dict:
                     if "text" in item:
                         condition_data["text"] = item.get("text", [])
                     structured_output[section_key].append(condition_data)
-    #print(f'structured_output:{structured_output}')
-
     return structured_output
+
+
+def get_reaction(image_path: str) -> dict:
+    '''
+    Returns a structured dictionary of reactions extracted from the image,
+    including reactants, conditions, and products, with their smiles, text, and bbox.
+    '''
+    raw_prediction = model1.predict_image_file(image_path, molnextr=True, ocr=True)
+    return _reaction_summary_from_raw(raw_prediction)
+
+
+def _caching_reaction_tool(cache):
+    """Return a tool handler that avoids a second nondeterministic GPU inference."""
+    def invoke(image_path: str) -> dict:
+        if "raw_prediction" not in cache:
+            cache["raw_prediction"] = model1.predict_image_file(
+                image_path, molnextr=True, ocr=True
+            )
+        return _reaction_summary_from_raw(cache["raw_prediction"])
+
+    return invoke
 
 
 
@@ -170,13 +180,14 @@ def get_reaction_withatoms(image_path: str) -> dict:
         }
     ]
 
+    raw_prediction_cache = {}
     gpt_output = _run_image_tool_agent(
         backend,
         image_path,
         messages,
         tools,
         "gpt-4o",
-        {"get_reaction": get_reaction},
+        {"get_reaction": _caching_reaction_tool(raw_prediction_cache)},
     )
     #print(f"gpt_output1:{gpt_output}")
 
@@ -190,7 +201,9 @@ def get_reaction_withatoms(image_path: str) -> dict:
         raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
         return raw_prediction
     
-    input2 = get_reaction_full(image_path)
+    input2 = raw_prediction_cache.get("raw_prediction")
+    if input2 is None:
+        input2 = get_reaction_full(image_path)
 
 
 
@@ -231,7 +244,8 @@ def get_reaction_withatoms(image_path: str) -> dict:
 
         return input2
     
-    updated_data = [update_input_with_symbols(gpt_output, input2[0], _convert_graph_to_smiles)]
+    raw_reaction = input2[0] if input2 else gpt_output
+    updated_data = [update_input_with_symbols(gpt_output, raw_reaction, _convert_graph_to_smiles)]
 
     return updated_data
 
@@ -293,13 +307,14 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
         }
     ]
 
+    raw_prediction_cache = {}
     gpt_output = _run_image_tool_agent(
         backend,
         image_path,
         messages,
         tools,
         "gpt-5-mini",
-        {"get_reaction": get_reaction},
+        {"get_reaction": _caching_reaction_tool(raw_prediction_cache)},
     )
     print(f"gpt_output_rxn:{gpt_output}")
 
@@ -314,7 +329,9 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
         raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
         return raw_prediction
     
-    input2 = get_reaction_full(image_path)
+    input2 = raw_prediction_cache.get("raw_prediction")
+    if input2 is None:
+        input2 = get_reaction_full(image_path)
 
 
 
@@ -359,7 +376,8 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
 
         return input2
     
-    updated_data = [update_input_with_symbols(gpt_output, input2[0], _convert_graph_to_smiles)]
+    raw_reaction = input2[0] if input2 else gpt_output
+    updated_data = [update_input_with_symbols(gpt_output, raw_reaction, _convert_graph_to_smiles)]
     updated_data = _patch_to_reaction(updated_data)
     print(f"rxn_agent_output:{updated_data}")
 
@@ -425,13 +443,14 @@ def get_reaction_withatoms_correctR_OS(
         }
     ]
 
+    raw_prediction_cache = {}
     gpt_output = _run_image_tool_agent(
         backend,
         image_path,
         messages,
         tools,
         model_name,
-        {"get_reaction": get_reaction},
+        {"get_reaction": _caching_reaction_tool(raw_prediction_cache)},
         extra={"extra_body": _get_extra_body(model_name)},
     )
     
@@ -447,7 +466,9 @@ def get_reaction_withatoms_correctR_OS(
         raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
         return raw_prediction
     
-    input2 = get_reaction_full(image_path)
+    input2 = raw_prediction_cache.get("raw_prediction")
+    if input2 is None:
+        input2 = get_reaction_full(image_path)
 
     def update_input_with_symbols(input1, input2, conversion_function):
         symbol_mapping = {}
@@ -490,7 +511,8 @@ def get_reaction_withatoms_correctR_OS(
 
         return input2
     
-    updated_data = [update_input_with_symbols(gpt_output, input2[0], _convert_graph_to_smiles)]
+    raw_reaction = input2[0] if input2 else gpt_output
+    updated_data = [update_input_with_symbols(gpt_output, raw_reaction, _convert_graph_to_smiles)]
     updated_data = _patch_to_reaction(updated_data)
     print(f"rxn_agent_output:{updated_data}")
 
