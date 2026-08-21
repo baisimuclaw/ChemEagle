@@ -1,6 +1,6 @@
 import json
 import base64
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from chemeagle_llm import (
     LLMBackend,
@@ -10,6 +10,11 @@ from chemeagle_llm import (
     create_backend,
 )
 from chemeagle_llm.base import parse_json_content
+from chemeagle_vision import (
+    VisionBackend,
+    create_vision_backend,
+    vision_scope,
+)
 
 def _normalize_agent_args(raw_args: Optional[dict], image_path: str) -> dict:
     if not isinstance(raw_args, dict):
@@ -406,21 +411,28 @@ def ChemEagle(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     backend: Optional[LLMBackend] = None,
+    vision_provider: Optional[str] = None,
+    vision_backend: Optional[VisionBackend] = None,
+    vision_options: Optional[Dict[str, Any]] = None,
     use_plan_observer: bool = False,
     use_action_observer: bool = False,
 ) -> dict:
     """Extract structured chemical data using the selected LLM backend.
 
-    ``provider`` may be ``azure`` (the backward-compatible default), ``codex``,
-    or ``local``.  Supplying an already-created backend is useful for batches
-    because one Codex App Server process can be reused across images.
+    ``provider`` selects the language model. ``vision_provider`` independently
+    selects local, SSH, or Slurm-over-SSH execution for the chemical vision
+    models. Supplying already-created backends reuses both persistent workers.
     """
     selected = backend or create_backend(
         provider, model=model, base_url=base_url, api_key=api_key
     )
+    selected_vision = vision_backend or create_vision_backend(
+        vision_provider, **(vision_options or {})
+    )
     owns_backend = backend is None
+    owns_vision_backend = vision_backend is None
     try:
-        with backend_scope(selected):
+        with backend_scope(selected), vision_scope(selected_vision):
             return _chemeagle_cloud_impl(
                 image_path,
                 backend=selected,
@@ -431,6 +443,8 @@ def ChemEagle(
     finally:
         if owns_backend:
             selected.close()
+        if owns_vision_backend:
+            selected_vision.close()
 
 
 def ChemEagle_OS(
@@ -439,6 +453,9 @@ def ChemEagle_OS(
     model_name: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    vision_provider: Optional[str] = None,
+    vision_backend: Optional[VisionBackend] = None,
+    vision_options: Optional[Dict[str, Any]] = None,
     use_plan_observer: bool = False,
     use_action_observer: bool = False,
 ) -> dict:
@@ -449,6 +466,9 @@ def ChemEagle_OS(
         model=model_name,
         base_url=base_url,
         api_key=api_key,
+        vision_provider=vision_provider,
+        vision_backend=vision_backend,
+        vision_options=vision_options,
         use_plan_observer=use_plan_observer,
         use_action_observer=use_action_observer,
     )

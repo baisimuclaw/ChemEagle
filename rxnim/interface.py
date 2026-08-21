@@ -20,8 +20,19 @@ import easyocr
 
 class RxnIM:
 
-    def __init__(self, model_path, device=None):
+    def __init__(
+        self,
+        model_path,
+        device=None,
+        molnextr_model=None,
+        ocr_model=None,
+        molnextr_path=None,
+        easyocr_model_dir=None,
+        offline=False,
+    ):
+        self.offline = bool(offline)
         args = self._get_args()
+        args.pretrained_backbone = not self.offline
         args.format = 'reaction'
         states = torch.load(model_path, map_location=torch.device('cpu'))
         if device is None:
@@ -30,8 +41,10 @@ class RxnIM:
         self.tokenizer = get_tokenizer(args)
         self.model = self.get_model(args, self.tokenizer, self.device, states['state_dict'])
         self.transform = make_transforms('test', augment=False, debug=False)
-        self.molnextr = self.get_molnextr()
-        self.ocr_model = self.get_ocr_model()
+        self.molnextr_path = molnextr_path
+        self.easyocr_model_dir = easyocr_model_dir
+        self.molnextr = molnextr_model or self.get_molnextr()
+        self.ocr_model = ocr_model or self.get_ocr_model()
 
     def _get_args(self):
         parser = argparse.ArgumentParser()
@@ -76,12 +89,22 @@ class RxnIM:
         return model
 
     def get_molnextr(self):
-        ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "molnextr.pth")
+        ckpt_path = self.molnextr_path
+        if ckpt_path is None and self.offline:
+            raise FileNotFoundError("Offline RxnIM requires an explicit MolNexTR checkpoint")
+        if ckpt_path is None:
+            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "molnextr.pth")
         molnextr = MolNexTR(ckpt_path, device=self.device)
         return molnextr
 
     def get_ocr_model(self):
-        reader = easyocr.Reader(['en'], gpu=(self.device.type == 'cuda'))
+        kwargs = {
+            "gpu": self.device.type == "cuda",
+            "download_enabled": not self.offline,
+        }
+        if self.easyocr_model_dir:
+            kwargs["model_storage_directory"] = self.easyocr_model_dir
+        reader = easyocr.Reader(['en'], **kwargs)
         return reader
 
     def predict_images(self, input_images: List, batch_size=16, molnextr=False, ocr=False):
@@ -164,8 +187,20 @@ class RxnIM:
 
 class MolDetect:
 
-    def __init__(self, model_path, device = None, coref = False):
+    def __init__(
+        self,
+        model_path,
+        device=None,
+        coref=False,
+        molnextr_model=None,
+        ocr_model=None,
+        molnextr_path=None,
+        easyocr_model_dir=None,
+        offline=False,
+    ):
+        self.offline = bool(offline)
         args = self._get_args()
+        args.pretrained_backbone = not self.offline
         if not coref: args.format = 'bbox'
         else: args.format = 'coref'
         states = torch.load(model_path, map_location = torch.device('cpu'))
@@ -175,8 +210,10 @@ class MolDetect:
         self.tokenizer = get_tokenizer(args)
         self.model = self.get_model(args, self.tokenizer, self.device, states['state_dict'])
         self.transform = make_transforms('test', augment=False, debug=False)
-        self.ocr_model = self.get_ocr_model()
-        self.molnextr = self.get_molnextr()
+        self.molnextr_path = molnextr_path
+        self.easyocr_model_dir = easyocr_model_dir
+        self.ocr_model = ocr_model or self.get_ocr_model()
+        self.molnextr = molnextr_model or self.get_molnextr()
 
     def _get_args(self):
         parser = argparse.ArgumentParser()
@@ -222,12 +259,22 @@ class MolDetect:
         return model
 
     def get_molnextr(self): 
-        ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "molnextr.pth")
+        ckpt_path = self.molnextr_path
+        if ckpt_path is None and self.offline:
+            raise FileNotFoundError("Offline MolDetect requires an explicit MolNexTR checkpoint")
+        if ckpt_path is None:
+            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "molnextr.pth")
         molnextr = MolNexTR(ckpt_path, device=self.device)
         return molnextr
 
     def get_ocr_model(self):
-        reader = easyocr.Reader(['en'], gpu = (self.device.type == 'cuda'))
+        kwargs = {
+            "gpu": self.device.type == "cuda",
+            "download_enabled": not self.offline,
+        }
+        if self.easyocr_model_dir:
+            kwargs["model_storage_directory"] = self.easyocr_model_dir
+        reader = easyocr.Reader(['en'], **kwargs)
         return reader
     
     def predict_images(self, input_images: List, batch_size = 16, molnextr = False, coref = False, ocr = False):
@@ -285,5 +332,3 @@ class MolDetect:
         plt.close(fig)
         return results
             
-
-

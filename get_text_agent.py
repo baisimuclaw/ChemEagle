@@ -12,15 +12,11 @@ from chemeagle_llm import (
 model_dir = "./cre_models_v0.1"
 rxn_extractor = RxnExtractor(model_dir)
 import json
-import torch
-from chemiener import ChemNER
-from huggingface_hub import hf_hub_download
-ckpt_path = "./ner.ckpt"
-model2 = ChemNER(ckpt_path, device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 import base64
 import os
 import shutil
 import re
+from chemeagle_vision.proxies import vision_chemner as model2
 
 
 # Configure Tesseract OCR path (Windows)

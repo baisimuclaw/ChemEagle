@@ -109,6 +109,24 @@ and troubleshooting guide](docs/llm_backends.md), including RTX 3080, 48 GB GPU,
 multi-GPU vLLM recommendations. Copy `.env.example` as a safe configuration template;
 never commit the resulting `.env`.
 
+### Remote chemical-vision GPUs
+
+The LLM and chemical-vision routes are independent. Codex can run on an
+internet-connected workstation while RxnIM, MolNexTR, and ChemNER run on an offline
+WSL or Slurm GPU through a persistent SSH JSONL worker:
+
+```python
+result = ChemEagle(
+    "./examples/1.png",
+    provider="codex",
+    vision_provider="slurm-ssh",  # local | ssh | slurm-ssh
+)
+```
+
+Remote workers accept only fixed vision methods, load one shared model set, and do not
+receive Codex credentials. See the [remote vision deployment guide](docs/remote_vision.md)
+for WSL, CUHK Slurm, offline weights, health checks, and configuration.
+
 #### Option A: Using Azure OpenAI (Cloud-based)
 
 1. First create and activate a [conda](https://numdifftools.readthedocs.io/en/stable/how-to/create_virtual_env_with_conda.html) environment with the following command in a Linux, Windows, or MacOS environment (Linux is the most recommended):
@@ -393,4 +411,3 @@ The input can be any chemical graphics; feel free to try more examples!
 ## :warning: Acknowledgement
 1. We use api_version="2024-10-21" with the HKUST Azure OpenAI endpoint as our official closed-source version.
 2. Our code is based on [MolNexTR](https://github.com/CYF2000127/MolNexTR), [MolScribe](https://github.com/thomas0809/MolScribe), [RxnIM](https://github.com/CYF2000127/RxnIM), [RxnScribe](https://github.com/thomas0809/RxNScribe), [ChemNER](https://github.com/Ozymandias314/ChemIENER), [ChemRxnExtractor](https://github.com/jiangfeng1124/ChemRxnExtractor), [AutoAgents](https://github.com/Link-AGI/AutoAgents), and [Azure OpenAI](https://azure.microsoft.com/).
-

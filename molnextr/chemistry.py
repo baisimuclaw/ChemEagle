@@ -41,6 +41,11 @@ OPSIN_BASE   = "https://opsin.ch.cam.ac.uk/opsin/"
 PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 CIR_BASE     = "https://cactus.nci.nih.gov/chemical/structure"
 
+
+def _network_disabled() -> bool:
+    value = os.getenv("CHEMEAGLE_OFFLINE", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
 # ========== Shorthand lexicon ==========
 # Only does a small "shorthand -> parsable English name" mapping; does not enumerate SMILES
 GROUP_LEXICON: Dict[str, str] = {
@@ -120,6 +125,8 @@ def _strip_group_multiplier(grp_raw: str) -> Tuple[str, Optional[int]]:
 
 # ========== External parsers ==========
 def _opsin_name_to_smiles(name: str) -> Optional[str]:
+    if _network_disabled():
+        return None
     url = f"{OPSIN_BASE}{urllib.parse.quote(name)}.json"
     try:
         r = requests.get(url, timeout=20)
@@ -131,6 +138,8 @@ def _opsin_name_to_smiles(name: str) -> Optional[str]:
         return None
 
 def _pubchem_name_to_smiles(name: str) -> Optional[str]:
+    if _network_disabled():
+        return None
     # name -> CID
     url = f"{PUBCHEM_BASE}/compound/name/{urllib.parse.quote(name)}/cids/JSON"
     try:
@@ -148,6 +157,8 @@ def _pubchem_name_to_smiles(name: str) -> Optional[str]:
         return None
 
 def _cir_name_to_smiles(name: str) -> Optional[str]:
+    if _network_disabled():
+        return None
     url = f"{CIR_BASE}/{urllib.parse.quote(name)}/smiles"
     try:
         r = requests.get(url, timeout=20)

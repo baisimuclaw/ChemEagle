@@ -157,6 +157,35 @@ class MolNexTR:
         return self.predict_image_files(
             [image_file], return_atoms_bonds=return_atoms_bonds, return_confidence=return_confidence)[0]
 
+    def convert_graph_to_output(self, graphs: List, images: List):
+        """Convert edited graph predictions back to the normal molecule output.
+
+        R-group workflows edit symbols/edges after neural inference and then
+        need the deterministic chemistry conversion again. Keeping this method
+        on the model interface also makes that operation available through the
+        allowlisted remote vision proxy.
+        """
+        coords = [graph["chartok_coords"]["coords"] for graph in graphs]
+        symbols = [graph["chartok_coords"]["symbols"] for graph in graphs]
+        edges = [graph["edges"] for graph in graphs]
+        smiles, molblocks, _success = convert_graph_to_smiles(
+            coords,
+            symbols,
+            edges,
+            images=images,
+            num_workers=self.num_workers,
+        )
+        return [
+            {
+                "smiles": smile,
+                "molfile": molblock,
+                "symbols": graph["chartok_coords"]["symbols"],
+                "coords": graph["chartok_coords"]["coords"],
+                "edges": graph["edges"],
+            }
+            for graph, smile, molblock in zip(graphs, smiles, molblocks)
+        ]
+
     def draw_prediction(self, prediction, image, notebook=False):
         if "atoms" not in prediction or "bonds" not in prediction:
             raise ValueError("atoms and bonds information are not provided.")

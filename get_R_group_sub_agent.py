@@ -1,7 +1,6 @@
 import sys
-import torch
 import json
-from chemietoolkit import ChemIEToolkit,utils
+from chemietoolkit import utils
 import cv2
 import numpy as np
 from PIL import Image
@@ -9,10 +8,8 @@ import json
 from get_molecular_agent import process_reaction_image_with_multiple_products_and_text_correctR, process_reaction_image_with_multiple_products_and_text_correctmultiR, process_reaction_image_with_multiple_products_and_text_correctmultiR_OS
 from get_reaction_agent import get_reaction_withatoms_correctR, get_reaction_withatoms_correctR_OS, get_reaction_con, get_reaction_con_OS
 import sys
-from rxnim import RxnIM
 import json
 import base64
-import torch
 import json
 from PIL import Image
 import numpy as np
@@ -30,13 +27,11 @@ from chemeagle_llm import (
     get_active_backend,
     parse_json_content,
 )
+from chemeagle_vision.proxies import (
+    vision_rxnim as model1,
+    vision_toolkit as model,
+)
 
-
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = ChemIEToolkit(device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')) 
-ckpt_path = "./rxn.ckpt"
-model1 = RxnIM(ckpt_path, device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 
 
 def normalize_product_variant_output(data: dict) -> dict:

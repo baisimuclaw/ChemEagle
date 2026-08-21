@@ -1,3 +1,4 @@
+import os
 import torch
 import re
 from functools import lru_cache
@@ -13,11 +14,16 @@ from .tableextractor import TableExtractor
 from .utils import *
 
 class ChemIEToolkit:
-    def __init__(self, device=None):
+    def __init__(self, device=None, model_dir=None, offline=False):
         if device is None:
             self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
         else:
             self.device = torch.device(device)
+
+        self.model_dir = (
+            os.path.abspath(os.path.expanduser(model_dir)) if model_dir else None
+        )
+        self.offline = bool(offline)
 
         self._molnextr = None
         self._rxnim = None
@@ -26,6 +32,40 @@ class ChemIEToolkit:
         self._chemrxnextractor = None
         self._chemner = None
         self._coref = None
+        self._ocr_model = None
+
+    def _local_model_path(self, filename):
+        if not self.model_dir:
+            return None
+        candidate = os.path.join(self.model_dir, filename)
+        return candidate if os.path.exists(candidate) else None
+
+    def _checkpoint(self, filename, repo_id):
+        local = self._local_model_path(filename)
+        if local:
+            return local
+        if self.offline:
+            raise FileNotFoundError(
+                f"Offline ChemEAGLE worker requires {filename!r} in {self.model_dir!r}"
+            )
+        return hf_hub_download(repo_id, filename)
+
+    @property
+    def ocr_model(self):
+        if self._ocr_model is None:
+            import easyocr
+
+            kwargs = {"gpu": self.device.type == "cuda", "download_enabled": not self.offline}
+            if self.model_dir:
+                easyocr_dir = os.path.join(self.model_dir, "easyocr")
+                if self.offline and not os.path.isdir(easyocr_dir):
+                    raise FileNotFoundError(
+                        "Offline EasyOCR requires an easyocr directory under "
+                        f"{self.model_dir!r}"
+                    )
+                kwargs["model_storage_directory"] = easyocr_dir
+            self._ocr_model = easyocr.Reader(["en"], **kwargs)
+        return self._ocr_model
 
     @property
     def molnextr(self):
@@ -41,7 +81,9 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "molnextr.pth")
+            ckpt_path = self._checkpoint(
+                "molnextr.pth", "CYF200127/ChemEAGLEModel"
+            )
         self._molnextr = MolNexTR(ckpt_path, device=self.device)
     
 
@@ -59,8 +101,14 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "rxn.ckpt")
-        self._rxnim = RxnIM(ckpt_path, device=self.device)
+            ckpt_path = self._checkpoint("rxn.ckpt", "CYF200127/ChemEAGLEModel")
+        self._rxnim = RxnIM(
+            ckpt_path,
+            device=self.device,
+            molnextr_model=self.molnextr,
+            ocr_model=self.ocr_model,
+            offline=self.offline,
+        )
     
 
     @property
@@ -94,8 +142,16 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "moldet.ckpt")
-        self._moldet = MolDetect(ckpt_path, device=self.device)
+            ckpt_path = self._checkpoint(
+                "moldet.ckpt", "CYF200127/ChemEAGLEModel"
+            )
+        self._moldet = MolDetect(
+            ckpt_path,
+            device=self.device,
+            molnextr_model=self.molnextr,
+            ocr_model=self.ocr_model,
+            offline=self.offline,
+        )
         
 
     @property
@@ -112,8 +168,17 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "corefdet.ckpt")
-        self._coref = MolDetect(ckpt_path, device=self.device, coref=True)
+            ckpt_path = self._checkpoint(
+                "corefdet.ckpt", "CYF200127/ChemEAGLEModel"
+            )
+        self._coref = MolDetect(
+            ckpt_path,
+            device=self.device,
+            coref=True,
+            molnextr_model=self.molnextr,
+            ocr_model=self.ocr_model,
+            offline=self.offline,
+        )
 
 
     @property
@@ -130,7 +195,16 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = snapshot_download(repo_id="amberwang/chemrxnextractor-training-modules")
+            ckpt_path = self._local_model_path("chemrxnextractor")
+        if ckpt_path is None and self.offline:
+            raise FileNotFoundError(
+                "Offline ChemEAGLE worker requires a chemrxnextractor directory "
+                f"under {self.model_dir!r}"
+            )
+        if ckpt_path is None:
+            ckpt_path = snapshot_download(
+                repo_id="amberwang/chemrxnextractor-training-modules"
+            )
         self._chemrxnextractor = ChemRxnExtractor("", None, ckpt_path, self.device.type)
 
 
@@ -148,8 +222,19 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "ner.ckpt")
-        self._chemner = ChemNER(ckpt_path, device=self.device)
+            ckpt_path = self._checkpoint("ner.ckpt", "CYF200127/ChemEAGLEModel")
+        base_model = self._local_model_path("biobert-large-cased")
+        if self.offline and base_model is None:
+            raise FileNotFoundError(
+                "Offline ChemNER requires biobert-large-cased under "
+                f"{self.model_dir!r}"
+            )
+        self._chemner = ChemNER(
+            ckpt_path,
+            device=self.device,
+            cache_dir=os.path.join(self.model_dir, "huggingface") if self.model_dir else None,
+            roberta_checkpoint=base_model,
+        )
 
     
     @property

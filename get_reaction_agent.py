@@ -1,13 +1,9 @@
 import sys
-import torch
 import json
-from chemietoolkit import ChemIEToolkit
 import cv2
 from PIL import Image
 import json
 import sys
-import torch
-from rxnim import RxnIM
 import json
 from molnextr.chemistry import _convert_graph_to_smiles
 import base64
@@ -24,13 +20,9 @@ from chemeagle_llm import (
     get_active_backend,
     parse_json_content,
 )
+from chemeagle_vision.proxies import vision_rxnim as model1
 
 
-
-ckpt_path = "./rxn.ckpt"
-model1 = RxnIM(ckpt_path, device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-model = ChemIEToolkit(device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')) 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def _run_image_tool_agent(
     backend,

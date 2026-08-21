@@ -490,6 +490,10 @@ def _query_pubchem_smiles(name: str, timeout: float = 5.0) -> Optional[str]:
     """
     if not name:
         return None
+    if os.getenv("CHEMEAGLE_OFFLINE", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        raise _ServiceUnavailable("PubChem disabled by CHEMEAGLE_OFFLINE")
     # Case-sensitive cache key: "NaH" and "nah" go through different code
     # paths in the strict synonym check, so they MUST cache separately.
     key = name.strip()
@@ -619,6 +623,10 @@ def _query_opsin_smiles(name: str, timeout: float = 5.0) -> Optional[str]:
     s = name.strip()
     if not s or len(s) > 200:
         return None
+    if os.getenv("CHEMEAGLE_OFFLINE", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return _local_opsin_smiles(s)
     enc = _urlparse.quote(s, safe='')
     url = f"https://opsin.ch.cam.ac.uk/opsin/{enc}.smi"
     try:
