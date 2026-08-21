@@ -322,7 +322,17 @@ class CodexBackendTests(unittest.TestCase):
 
     def test_text_image_schema_and_subscription_account(self):
         backend, script = self.make_backend()
-        schema = {"type": "object", "required": ["reactions"]}
+        schema = {
+            "type": "object",
+            "properties": {
+                "reactions": {
+                    "type": "array",
+                    "items": {"type": "object", "additionalProperties": False},
+                }
+            },
+            "required": ["reactions"],
+            "additionalProperties": False,
+        }
         try:
             response = backend.generate(
                 LLMRequest(
@@ -375,6 +385,10 @@ class CodexBackendTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(response.content), {"reactions": []})
             self.assertEqual(script.dynamic_reply["success"], True)
+            self.assertIsNone(
+                script.output_schema,
+                "generic json_mode must rely on local JSON validation",
+            )
             tool_payload = json.loads(script.dynamic_reply["contentItems"][0]["text"])
             self.assertEqual(tool_payload, {"doubled": 6})
         finally:
@@ -498,7 +512,7 @@ class CodexBackendTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(response.content), {"reactions": []})
             self.assertEqual(script.turn_count, 2)
-            self.assertEqual(script.output_schema["type"], "object")
+            self.assertIsNone(script.output_schema)
         finally:
             backend.close()
 

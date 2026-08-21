@@ -695,8 +695,6 @@ class CodexAppServerBackend(BaseLLMBackend):
             if not thread_id:
                 raise BackendProcessError("Codex thread/start returned no thread id")
             output_schema = request.output_schema
-            if output_schema is None and request.json_mode:
-                output_schema = {"type": "object", "additionalProperties": True}
             attempts = max(1, min(self.config.max_retries, 3))
             for attempt in range(attempts):
                 turn_inputs = inputs
