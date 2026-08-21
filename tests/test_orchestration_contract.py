@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -10,6 +12,10 @@ from unittest import mock
 import main
 import get_reaction_agent
 import get_text_agent
+from chemeagle_vision.request_cache import (
+    caching_molecular_tool,
+    molecular_results_for_request,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +83,77 @@ class ImportAndOrchestrationTests(unittest.TestCase):
         self.assertIs(cache["raw_prediction"], raw)
         self.assertEqual(summary["reactants"][0]["smiles"], "C")
         self.assertEqual(cached_summary, summary)
+
+    def test_molecular_tool_reuses_raw_prediction_without_stripping_graph(self):
+        raw = [
+            {
+                "bboxes": [
+                    {
+                        "category": "[Mol]",
+                        "bbox": [0, 0, 1, 1],
+                        "symbols": ["C"],
+                        "coords": [[0.5, 0.5]],
+                        "edges": [],
+                        "atoms": [{"atom_symbol": "C"}],
+                        "molfile": "molfile",
+                        "score": 0.9,
+                    }
+                ],
+                "corefs": [],
+            }
+        ]
+        cache = {}
+        predict = mock.Mock(return_value=raw)
+        tool = caching_molecular_tool(cache, predict)
+        compact = json.loads(tool("input.png"))
+        cached_compact = json.loads(tool("input.png"))
+
+        predict.assert_called_once_with("input.png")
+        self.assertIs(cache["raw_prediction"], raw)
+        self.assertEqual(cached_compact, compact)
+        self.assertNotIn("coords", compact[0]["bboxes"][0])
+        self.assertNotIn("edges", compact[0]["bboxes"][0])
+        self.assertEqual(raw[0]["bboxes"][0]["coords"], [[0.5, 0.5]])
+        self.assertEqual(raw[0]["bboxes"][0]["atoms"][0]["atom_symbol"], "C")
+
+        fallback_cache = {}
+        fallback_predict = mock.Mock(return_value=raw)
+        fallback_raw = molecular_results_for_request(
+            fallback_cache,
+            fallback_predict,
+            "input.png",
+        )
+        repeated_raw = molecular_results_for_request(
+            fallback_cache,
+            fallback_predict,
+            "input.png",
+        )
+        fallback_predict.assert_called_once_with("input.png")
+        self.assertIs(fallback_raw, raw)
+        self.assertIs(repeated_raw, raw)
+
+    def test_all_molecular_agent_variants_use_request_scoped_raw_cache(self):
+        source = (ROOT / "get_molecular_agent.py").read_text(encoding="utf-8")
+        functions = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.parse(source).body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        variants = (
+            "process_reaction_image_with_multiple_products_and_text",
+            "process_reaction_image_with_multiple_products_and_text_correctR",
+            "process_reaction_image_with_multiple_products_and_text_correctmultiR",
+            "process_reaction_image_with_multiple_products_and_text_correctmultiR_OS",
+        )
+        for variant in variants:
+            with self.subTest(variant=variant):
+                function_source = functions[variant]
+                self.assertIn("_caching_molecular_tool", function_source)
+                self.assertIn("_molecular_results_for_request", function_source)
+                self.assertNotIn(
+                    "extract_molecule_corefs_from_figures",
+                    function_source,
+                )
 
     def test_import_main_without_api_environment_or_heavy_models(self):
         env = dict(os.environ)

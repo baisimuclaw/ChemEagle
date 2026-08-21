@@ -87,7 +87,7 @@ def get_reaction(image_path: str) -> dict:
 
 
 def _caching_reaction_tool(cache):
-    """Return a tool handler that avoids a second nondeterministic GPU inference."""
+    """Return a request-scoped tool that avoids redundant GPU inference."""
     def invoke(image_path: str) -> dict:
         if "raw_prediction" not in cache:
             cache["raw_prediction"] = model1.predict_image_file(

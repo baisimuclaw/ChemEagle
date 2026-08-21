@@ -25,6 +25,12 @@ from chemeagle_llm import (
     parse_json_content,
 )
 from chemeagle_vision.proxies import vision_toolkit as model
+from chemeagle_vision.request_cache import (
+    MOLECULAR_TOOL_OMITTED_FIELDS as _MOLECULAR_TOOL_OMITTED_FIELDS,
+    caching_molecular_tool,
+    compact_molecular_tool_result as _compact_molecular_tool_result,
+    molecular_results_for_request,
+)
 
 
 
@@ -76,53 +82,64 @@ def _run_image_tool_agent(backend, image_path, messages, tools, model_name, hand
     )
     return [parse_json_content(response)]
 
+
+def _predict_molecular(image_path: str) -> list:
+    """Run molecule/coreference vision inference once and retain its full result."""
+    image = Image.open(image_path).convert("RGB")
+    return model.extract_molecule_corefs_from_figures([image])
+
+
+def _caching_molecular_tool(cache):
+    """Return a request-scoped tool that reuses one full vision prediction."""
+    return caching_molecular_tool(cache, _predict_molecular)
+
+
+def _molecular_results_for_request(cache, image_path: str) -> list:
+    """Return the request's retained raw graph, running vision only if no tool ran."""
+    return molecular_results_for_request(cache, _predict_molecular, image_path)
+
 def get_multi_molecular(image_path: str) -> list:
     '''Returns a list of reactions extracted from the image.'''
-    # Open image file
-    image = Image.open(image_path).convert('RGB')
-    
-    # Pass image as input to the model
-    coref_results = model.extract_molecule_corefs_from_figures([image])
-    #print(f"coref_results:{coref_results}")
-    for item in coref_results:
-        for bbox in item.get("bboxes", []):
-            for key in ["category", "molfile", "symbols", 'atoms', "bonds", 'category_id', 'score', 'corefs']: #'atoms'
-                bbox.pop(key, None)  # Safely remove key
-    #print(json.dumps(coref_results))
-    # Return reaction list, formatted with json.dumps
-    
-    return json.dumps(coref_results)
+    raw_prediction = _predict_molecular(image_path)
+    return _compact_molecular_tool_result(
+        raw_prediction,
+        (
+            "category",
+            "molfile",
+            "symbols",
+            "atoms",
+            "bonds",
+            "category_id",
+            "score",
+            "corefs",
+        ),
+    )
 
 def get_multi_molecular_text_to_correct(image_path: str) -> list:
     '''Returns a list of reactions extracted from the image.'''
-    # Open image file
-    image = Image.open(image_path).convert('RGB')
-    
-    # Pass image as input to the model
-    coref_results = model.extract_molecule_corefs_from_figures([image])
-    for item in coref_results:
-        for bbox in item.get("bboxes", []):
-            for key in ["category", "bbox", "molfile", "symbols", 'atoms', "bonds", 'category_id', 'score', 'corefs']: #'atoms'
-                bbox.pop(key, None)  # Safely remove key
-    #print(json.dumps(coref_results))
-    # Return reaction list, formatted with json.dumps
-    
-    return json.dumps(coref_results)
+    raw_prediction = _predict_molecular(image_path)
+    return _compact_molecular_tool_result(
+        raw_prediction,
+        (
+            "category",
+            "bbox",
+            "molfile",
+            "symbols",
+            "atoms",
+            "bonds",
+            "category_id",
+            "score",
+            "corefs",
+        ),
+    )
 
 def get_multi_molecular_text_to_correct_withatoms(image_path: str) -> list:
     '''Returns a list of reactions extracted from the image.'''
-    # Open image file
-    image = Image.open(image_path).convert('RGB')
-    
-    # Pass image as input to the model
-    coref_results = model.extract_molecule_corefs_from_figures([image])
-    for item in coref_results:
-        for bbox in item.get("bboxes", []):
-            for key in ["coords","edges","molfile", 'atoms', "bonds", 'category_id', 'score', 'corefs']: #'atoms'
-                bbox.pop(key, None)  # Safely remove key
-    #print(json.dumps(coref_results))
-    # Return reaction list, formatted with json.dumps
-    return json.dumps(coref_results)
+    raw_prediction = _predict_molecular(image_path)
+    return _compact_molecular_tool_result(
+        raw_prediction,
+        _MOLECULAR_TOOL_OMITTED_FIELDS,
+    )
 
 
 
@@ -186,6 +203,7 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
         }
     ]
 
+    raw_prediction_cache = {}
     gpt_output = _run_image_tool_agent(
         backend,
         image_path,
@@ -194,22 +212,14 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
         "gpt-4o",
         {
             "get_multi_molecular_text_to_correct_withatoms":
-                get_multi_molecular_text_to_correct_withatoms,
+                _caching_molecular_tool(raw_prediction_cache),
         },
     )
 
-
-    def get_multi_molecular(image_path: str) -> list:
-        '''Returns a list of reactions extracted from the image.'''
-        # Open image file
-        image = Image.open(image_path).convert('RGB')
-        
-        # Pass image as input to the model
-        coref_results = model.extract_molecule_corefs_from_figures([image])
-        return coref_results
-
-    
-    coref_results = get_multi_molecular(image_path)
+    coref_results = _molecular_results_for_request(
+        raw_prediction_cache,
+        image_path,
+    )
 
 
     def update_symbols_in_atoms(input1, input2):
@@ -350,6 +360,7 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
         }
     ]
 
+    raw_prediction_cache = {}
     gpt_output = _run_image_tool_agent(
         backend,
         image_path,
@@ -358,23 +369,15 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
         "gpt-4o",
         {
             "get_multi_molecular_text_to_correct_withatoms":
-                get_multi_molecular_text_to_correct_withatoms,
+                _caching_molecular_tool(raw_prediction_cache),
         },
     )
     print(f"gpt_output_mol:{gpt_output}")
 
-
-    def get_multi_molecular(image_path: str) -> list:
-        '''Returns a list of reactions extracted from the image.'''
-        # Open image file
-        image = Image.open(image_path).convert('RGB')
-        
-        # Pass image as input to the model
-        coref_results = model.extract_molecule_corefs_from_figures([image])
-        return coref_results
-
-    
-    coref_results = get_multi_molecular(image_path)
+    coref_results = _molecular_results_for_request(
+        raw_prediction_cache,
+        image_path,
+    )
 
 
     def update_symbols_in_atoms(input1, input2):
@@ -510,6 +513,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
         }
     ]
 
+    raw_prediction_cache = {}
     gpt_output = _run_image_tool_agent(
         backend,
         image_path,
@@ -518,23 +522,15 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
         "gpt-5-mini",
         {
             "get_multi_molecular_text_to_correct_withatoms":
-                get_multi_molecular_text_to_correct_withatoms,
+                _caching_molecular_tool(raw_prediction_cache),
         },
     )
     print(f"gpt_output_mol:{gpt_output}")
 
-
-    def get_multi_molecular(image_path: str) -> list:
-        '''Returns a list of reactions extracted from the image.'''
-        # Open image file
-        image = Image.open(image_path).convert('RGB')
-        
-        # Pass image as input to the model
-        coref_results = model.extract_molecule_corefs_from_figures([image])
-        return coref_results
-
-    
-    coref_results = get_multi_molecular(image_path)
+    coref_results = _molecular_results_for_request(
+        raw_prediction_cache,
+        image_path,
+    )
 
 
     def update_symbols_and_corefs(gpt_outputs, coref_results):
@@ -701,6 +697,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
         }
     ]
 
+    raw_prediction_cache = {}
     gpt_output = _run_image_tool_agent(
         backend,
         image_path,
@@ -709,22 +706,16 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
         model_name,
         {
             "get_multi_molecular_text_to_correct_withatoms":
-                get_multi_molecular_text_to_correct_withatoms,
+                _caching_molecular_tool(raw_prediction_cache),
         },
     )
     
     print(f"gpt_output_mol:{gpt_output}")
 
-    def get_multi_molecular(image_path: str) -> list:
-        '''Returns a list of reactions extracted from the image.'''
-        # Open image file
-        image = Image.open(image_path).convert('RGB')
-        
-        # Pass image as input to the model
-        coref_results = model.extract_molecule_corefs_from_figures([image])
-        return coref_results
-
-    coref_results = get_multi_molecular(image_path)
+    coref_results = _molecular_results_for_request(
+        raw_prediction_cache,
+        image_path,
+    )
 
     def update_symbols_and_corefs(gpt_outputs, coref_results):
         results = []

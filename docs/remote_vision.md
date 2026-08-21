@@ -97,6 +97,24 @@ export CHEMEAGLE_VISION_OFFLINE=true
 The workstation starts one persistent SSH process. The worker loads models lazily and
 reuses them across nested ChemEAGLE tool calls.
 
+## Per-request vision inference lifecycle
+
+Reaction-template and molecular-recognition agents retain the complete first vision
+prediction for the lifetime of one image request. The LLM receives a deep-copied,
+compact projection with large graph fields such as `coords`, `edges`, `atoms`, and
+`molfile` removed. After the LLM corrects atom symbols or expands R-groups, ChemEAGLE
+applies those corrections to the retained prediction and runs Graph2SMILES.
+
+This applies to all four molecular-recognition entry points: the base, `correctR`,
+`correctmultiR`, and local-vLLM (`OS`) variants. They do not run MolDetector/Image2Graph
+a second time merely to recover fields removed from the LLM payload. Reaction-template
+entry points use the same lifecycle for RxnIM predictions.
+
+The retained prediction is request-scoped, not process-global. Concurrent images cannot
+reuse or overwrite one another's graph data. If an LLM backend returns without invoking
+the vision tool, ChemEAGLE performs one fallback vision call so downstream graph
+reconstruction still has a complete prediction.
+
 Request-scoped vision selection is propagated into Codex dynamic-tool threads. This is
 important: without that propagation, a nested agent could fall back to loading vision
 models on the workstation instead of using the configured SSH worker.
