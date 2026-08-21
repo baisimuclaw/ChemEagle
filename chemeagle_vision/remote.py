@@ -98,6 +98,30 @@ class RemoteVisionBackend:
         command = ["env", *environment, *self.remote_argv()]
         return f"cd {shlex.quote(remote_dir)} && exec {shlex.join(command)}"
 
+    def submit_command(self) -> str:
+        """Return the command executed on the externally reachable SSH host.
+
+        Some clusters prohibit long-running scheduler clients on login nodes and
+        provide an internal submit host instead.  In that case the outer SSH
+        connection starts a second, stdio-preserving SSH connection before srun.
+        """
+        command = self.remote_command()
+        submit_host = self.config.slurm_submit_host
+        if self.config.provider != "slurm-ssh" or not submit_host:
+            return command
+        nested_ssh = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=3",
+            submit_host,
+            command,
+        ]
+        return f"exec {shlex.join(nested_ssh)}"
+
     def ssh_command(self) -> List[str]:
         argv = [self.config.ssh_binary]
         if self.config.ssh_config:
@@ -111,7 +135,7 @@ class RemoteVisionBackend:
                 "-o",
                 "ServerAliveCountMax=3",
                 self.config.ssh_host or "",
-                self.remote_command(),
+                self.submit_command(),
             ]
         )
         return argv

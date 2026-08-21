@@ -114,6 +114,7 @@ export CHEMEAGLE_VISION_SLURM_ACCOUNT=xlzhang
 export CHEMEAGLE_VISION_SLURM_QOS=xlzhang
 export CHEMEAGLE_VISION_SLURM_RESERVATION=xlzhang_gpu
 export CHEMEAGLE_VISION_SLURM_PARTITION=chpc
+export CHEMEAGLE_VISION_SLURM_SUBMIT_HOST=sandbox
 export CHEMEAGLE_VISION_SLURM_GPU_TYPE=L40S
 export CHEMEAGLE_VISION_SLURM_GPUS=1
 export CHEMEAGLE_VISION_SLURM_CPUS=8
@@ -121,9 +122,12 @@ export CHEMEAGLE_VISION_SLURM_MEMORY=64G
 export CHEMEAGLE_VISION_SLURM_TIME=08:00:00
 ```
 
-The generated command is equivalent to `ssh cuhk 'srun ... python -m
-chemeagle_vision.worker --stdio'`. SSH transports stdin/stdout; `srun` still performs
-the mandatory allocation. Closing the backend ends the worker and releases the GPU.
+With `CHEMEAGLE_VISION_SLURM_SUBMIT_HOST=sandbox`, the generated command is equivalent
+to `ssh cuhk 'ssh sandbox "srun ... python -m chemeagle_vision.worker --stdio"'`.
+This keeps the long-running `srun` client off the login node while preserving worker
+stdin/stdout through both SSH connections. Leave the variable unset on clusters that
+permit `srun` directly from the login host. Closing the backend ends the worker and
+releases the GPU allocation.
 
 ## Health check before a full run
 
@@ -195,3 +199,5 @@ parallelism, start several workers with separate Slurm GPU allocations.
   that `CHEMEAGLE_VISION_MODEL_DIR` is a remote path.
 - invalid JSONL: custom model code wrote to stdout instead of stderr.
 - SSH exits: verify the alias with `ssh -F ~/.ssh/config HOST true`.
+- submit-host SSH exits: first run `ssh cuhk 'ssh sandbox true'`; the internal host
+  may deliberately accept only a key installed on the login node.

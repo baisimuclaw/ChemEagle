@@ -31,12 +31,14 @@ class VisionConfigTests(unittest.TestCase):
                 "CHEMEAGLE_VISION_SSH_HOST": "cuhk",
                 "CHEMEAGLE_VISION_REMOTE_DIR": "/shared/ChemEagle",
                 "CHEMEAGLE_VISION_SLURM_ACCOUNT": "xlzhang",
+                "CHEMEAGLE_VISION_SLURM_SUBMIT_HOST": "sandbox",
             },
         )
         self.assertEqual(config.provider, "slurm-ssh")
         self.assertEqual(config.device, "cuda")
         self.assertTrue(config.offline)
         self.assertEqual(config.slurm_account, "xlzhang")
+        self.assertEqual(config.slurm_submit_host, "sandbox")
 
     def test_remote_requires_host_and_directory(self):
         config = VisionConfig(provider="ssh", ssh_host="worker")
@@ -57,12 +59,15 @@ class VisionConfigTests(unittest.TestCase):
             slurm_qos="xlzhang",
             slurm_reservation="xlzhang_gpu",
             slurm_partition="chpc",
+            slurm_submit_host="sandbox",
         )
         backend = RemoteVisionBackend(config)
         command = backend.ssh_command()
         self.assertEqual(command[0], "ssh")
         self.assertIn("BatchMode=yes", command)
         remote = command[-1]
+        self.assertTrue(remote.startswith("exec ssh "))
+        self.assertIn("sandbox", remote)
         self.assertIn("srun --quiet --unbuffered", remote)
         self.assertIn("--account xlzhang", remote)
         self.assertIn("--gres=gpu:L40S:1", remote)
@@ -70,6 +75,16 @@ class VisionConfigTests(unittest.TestCase):
         self.assertIn("CHEMEAGLE_OFFLINE=1", remote)
         self.assertIn("chemeagle_vision.worker", remote)
         self.assertNotIn("OPENAI", remote)
+
+    def test_slurm_without_submit_host_stays_on_login_host(self):
+        config = VisionConfig(
+            provider="slurm-ssh",
+            ssh_host="cluster-login",
+            remote_dir="/shared/ChemEagle",
+        )
+        remote = RemoteVisionBackend(config).ssh_command()[-1]
+        self.assertTrue(remote.startswith("cd "))
+        self.assertNotIn("exec ssh", remote)
 
     def test_ssh_config_expands_home_without_using_a_shell(self):
         config = VisionConfig(

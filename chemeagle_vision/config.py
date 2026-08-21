@@ -41,6 +41,7 @@ class VisionConfig:
     slurm_qos: Optional[str] = None
     slurm_reservation: Optional[str] = None
     slurm_partition: Optional[str] = None
+    slurm_submit_host: Optional[str] = None
     slurm_gpu_type: str = "L40S"
     slurm_gpus: int = 1
     slurm_cpus: int = 8
@@ -89,6 +90,9 @@ class VisionConfig:
             slurm_qos=values.get("CHEMEAGLE_VISION_SLURM_QOS"),
             slurm_reservation=values.get("CHEMEAGLE_VISION_SLURM_RESERVATION"),
             slurm_partition=values.get("CHEMEAGLE_VISION_SLURM_PARTITION"),
+            slurm_submit_host=values.get(
+                "CHEMEAGLE_VISION_SLURM_SUBMIT_HOST"
+            ),
             slurm_gpu_type=values.get("CHEMEAGLE_VISION_SLURM_GPU_TYPE", "L40S"),
             slurm_gpus=int(values.get("CHEMEAGLE_VISION_SLURM_GPUS", "1")),
             slurm_cpus=int(values.get("CHEMEAGLE_VISION_SLURM_CPUS", "8")),

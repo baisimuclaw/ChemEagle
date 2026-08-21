@@ -125,7 +125,8 @@ result = ChemEagle(
 
 Remote workers accept only fixed vision methods, load one shared model set, and do not
 receive Codex credentials. See the [remote vision deployment guide](docs/remote_vision.md)
-for WSL, CUHK Slurm, offline weights, health checks, and configuration.
+for WSL, CUHK Slurm, login-to-submit-host hops, offline weights, health checks, and
+configuration.
 
 #### Option A: Using Azure OpenAI (Cloud-based)
 
