@@ -276,6 +276,20 @@ class CodexBackendTests(unittest.TestCase):
             with self.assertRaises(BackendProcessError):
                 client._check_version()
 
+    def test_dynamic_tools_use_the_separate_long_timeout(self):
+        config = BackendConfig(
+            provider="codex", model="available-model", timeout=5, tool_timeout=1234
+        )
+        backend = CodexAppServerBackend(config, client=mock.Mock())
+        with mock.patch.object(backend, "_run", return_value=mock.sentinel.response) as run:
+            result = backend.run_tool_loop(
+                LLMRequest(messages=[{"role": "user", "content": "tool"}]),
+                [],
+                {},
+            )
+        self.assertIs(result, mock.sentinel.response)
+        self.assertEqual(run.call_args.args[0].timeout, 1234)
+
     def test_managed_spawn_uses_stdio_controlled_cwd_and_strips_api_keys(self):
         captured = {}
 

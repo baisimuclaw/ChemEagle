@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from contextvars import copy_context
 from dataclasses import replace
 from typing import Any, Callable, Dict, Mapping, Protocol, runtime_checkable
 
@@ -116,8 +117,13 @@ def bind_image_tools(
     """
 
     def bind(handler: Callable[[str], Any]) -> Callable[..., Any]:
+        # Codex App Server invokes dynamic tools on its protocol-reader thread.
+        # Capture the caller's request context so request-scoped LLM/vision
+        # backends are not silently replaced by process defaults there.
+        caller_context = copy_context()
+
         def invoke(**_arguments: Any) -> Any:
-            return handler(image_path)
+            return caller_context.copy().run(handler, image_path)
 
         return invoke
 

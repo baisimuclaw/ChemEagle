@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import unittest
+from contextvars import ContextVar
 from types import SimpleNamespace
 
 from chemeagle_llm.base import bind_image_tools, parse_json_content
@@ -93,6 +95,17 @@ class BackendConfigTests(unittest.TestCase):
     def test_unknown_provider_rejected(self):
         with self.assertRaises(ValueError):
             BackendConfig.from_env("mystery", env={})
+
+    def test_tool_timeout_has_independent_environment_setting(self):
+        config = BackendConfig.from_env(
+            "codex",
+            env={
+                "CHEMEAGLE_LLM_TIMEOUT": "90",
+                "CHEMEAGLE_LLM_TOOL_TIMEOUT": "1234",
+            },
+        )
+        self.assertEqual(config.timeout, 90)
+        self.assertEqual(config.tool_timeout, 1234)
 
     def test_credentials_are_validated_only_when_client_is_needed(self):
         backend = create_backend(config=BackendConfig(provider="azure", model="m"))
@@ -298,6 +311,22 @@ class OpenAICompatibleContractTests(unittest.TestCase):
         )
         self.assertEqual(executor["read"](image_path="/etc/passwd"), "ok")
         self.assertEqual(seen, ["/trusted/input.png"])
+
+        marker = ContextVar("test_image_tool_context", default="default")
+        token = marker.set("remote-request")
+        try:
+            contextual = bind_image_tools(
+                "/trusted/input.png", {"read": lambda _path: marker.get()}
+            )
+        finally:
+            marker.reset(token)
+        threaded_result = []
+        thread = threading.Thread(
+            target=lambda: threaded_result.append(contextual["read"]())
+        )
+        thread.start()
+        thread.join()
+        self.assertEqual(threaded_result, ["remote-request"])
 
 
 if __name__ == "__main__":

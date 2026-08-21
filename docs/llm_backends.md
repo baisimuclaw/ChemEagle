@@ -109,6 +109,11 @@ registered for the current ChemEAGLE request can run. The `dynamicTools` interfa
 experimental; a CLI version without it fails clearly instead of returning partial
 chemistry.
 
+Dynamic tools can include remote model cold starts and complex reaction tables. Their
+timeout is separate from an ordinary LLM turn and defaults to one hour. Override it
+with `CHEMEAGLE_LLM_TOOL_TIMEOUT` when cluster queue/startup policy requires a larger
+value; `CHEMEAGLE_LLM_TIMEOUT` continues to control ordinary turns.
+
 ## Azure OpenAI backend
 
 Azure remains the no-argument default. Both explicit names and the original aliases

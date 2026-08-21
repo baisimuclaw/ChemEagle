@@ -798,7 +798,11 @@ class CodexAppServerBackend(BaseLLMBackend):
             if name in schemas
         }
         return self._run(
-            replace(request, tools=[]),
+            replace(
+                request,
+                tools=[],
+                timeout=request.timeout or self.config.tool_timeout,
+            ),
             tools=tools,
             executor=validated_executor,
         )

@@ -96,6 +96,10 @@ export CHEMEAGLE_VISION_OFFLINE=true
 The workstation starts one persistent SSH process. The worker loads models lazily and
 reuses them across nested ChemEAGLE tool calls.
 
+Request-scoped vision selection is propagated into Codex dynamic-tool threads. This is
+important: without that propagation, a nested agent could fall back to loading vision
+models on the workstation instead of using the configured SSH worker.
+
 ## CUHK Slurm L40S
 
 This matches the identified group reservation; adjust paths and resource sizes:

@@ -20,6 +20,7 @@ import os
 import io
 import re
 import threading
+from contextvars import copy_context
 from chemeagle_llm import (
     LLMRequest,
     backend_model,
@@ -221,11 +222,16 @@ def _run_image_tool_agent_with_results(
     result_lock = threading.Lock()
 
     def bind(name, handler):
+        caller_context = copy_context()
+
         def invoke(**_arguments):
             # Ignore the model-provided path. Nested LLM agents inherit exactly
             # the current backend via the request scope.
-            with backend_scope(backend):
-                value = handler(image_path)
+            def run_handler():
+                with backend_scope(backend):
+                    return handler(image_path)
+
+            value = caller_context.copy().run(run_handler)
             message = {
                 "role": "tool",
                 "name": name,
@@ -1527,8 +1533,10 @@ def process_reaction_image_with_table_R_group(image_path: str) -> dict:
         reactions_output = {"reactions": []}  # store final reaction output
         
         # Iterate over each reaction in input2
-        for reaction in input2['reactions']:
-            reaction_id = reaction['reaction_id']
+        for reaction in input2.get('reactions', []):
+            if not isinstance(reaction, dict):
+                continue
+            reaction_id = reaction.get('reaction_id', str(len(reactions_output['reactions'])))
             
             # Build new reaction dictionary
             new_reaction = {"reaction_id": reaction_id, "reactants": [], "conditions":[], "products": [], "additional_info": []}
@@ -1546,23 +1554,36 @@ def process_reaction_image_with_table_R_group(image_path: str) -> dict:
                     new_reaction["reactants"].append(new_reactant)
                 else:
                     # If molecule type, get corresponding symbols from reaction['reactants']
-                    if mol_idx < len(reaction['reactants']):
-                        reactant = reaction['reactants'][mol_idx]
-                        mol_idx += 1
-                        
-                        new_symbols_reactant = reactant['symbols']  # replace with symbols in reaction
+                    reaction_reactants = reaction.get('reactants', [])
+                    reactant = (
+                        reaction_reactants[mol_idx]
+                        if mol_idx < len(reaction_reactants)
+                        and isinstance(reaction_reactants[mol_idx], dict)
+                        else {}
+                    )
+                    mol_idx += 1
+
+                    new_symbols_reactant = reactant.get('symbols')
+                    if (
+                        not isinstance(new_symbols_reactant, list)
+                        or len(new_symbols_reactant) != len(original_reactant['coords'])
+                    ):
+                        new_symbols_reactant = original_reactant.get('symbols', [])
+                    if len(new_symbols_reactant) == len(original_reactant['coords']):
                         new_smiles_reactant, __, __ = _convert_graph_to_smiles(original_reactant['coords'], new_symbols_reactant, original_reactant['edges'])  # generate new SMILES
-                        
-                        new_reactant = {
-                            #"category": original_reactant['category'],
-                            #"bbox": original_reactant['bbox'],
-                            #"category_id": original_reactant['category_id'],
-                            "smiles": new_smiles_reactant,
-                            #"coords": original_reactant['coords'],
-                            "symbols": new_symbols_reactant,
-                            #"edges": original_reactant['edges']
-                        }
-                        new_reaction["reactants"].append(new_reactant)
+                    else:
+                        new_smiles_reactant = original_reactant.get('smiles', '')
+
+                    new_reactant = {
+                        #"category": original_reactant['category'],
+                        #"bbox": original_reactant['bbox'],
+                        #"category_id": original_reactant['category_id'],
+                        "smiles": new_smiles_reactant,
+                        #"coords": original_reactant['coords'],
+                        "symbols": new_symbols_reactant,
+                        #"edges": original_reactant['edges']
+                    }
+                    new_reaction["reactants"].append(new_reactant)
 
             if 'conditions' in reaction:
                 new_reaction['conditions'] = reaction['conditions']
@@ -1582,23 +1603,36 @@ def process_reaction_image_with_table_R_group(image_path: str) -> dict:
                     new_reaction["products"].append(new_product)
                 else:
                     # If molecule type, get corresponding symbols from reaction['products']
-                    if mol_idx < len(reaction['products']):
-                        product = reaction['products'][mol_idx]
-                        mol_idx += 1
-                        
-                        new_symbols_product = product['symbols']  # replace with symbols in reaction
+                    reaction_products = reaction.get('products', [])
+                    product = (
+                        reaction_products[mol_idx]
+                        if mol_idx < len(reaction_products)
+                        and isinstance(reaction_products[mol_idx], dict)
+                        else {}
+                    )
+                    mol_idx += 1
+
+                    new_symbols_product = product.get('symbols')
+                    if (
+                        not isinstance(new_symbols_product, list)
+                        or len(new_symbols_product) != len(original_product['coords'])
+                    ):
+                        new_symbols_product = original_product.get('symbols', [])
+                    if len(new_symbols_product) == len(original_product['coords']):
                         new_smiles_product, __, __ = _convert_graph_to_smiles(original_product['coords'], new_symbols_product, original_product['edges'])  # generate new SMILES
-                        
-                        new_product = {
-                            #"category": original_product['category'],
-                            #"bbox": original_product['bbox'],
-                            #"category_id": original_product['category_id'],
-                            "smiles": new_smiles_product,
-                            #"coords": original_product['coords'],
-                            "symbols": new_symbols_product,
-                            #"edges": original_product['edges']
-                        }
-                        new_reaction["products"].append(new_product)
+                    else:
+                        new_smiles_product = original_product.get('smiles', '')
+
+                    new_product = {
+                        #"category": original_product['category'],
+                        #"bbox": original_product['bbox'],
+                        #"category_id": original_product['category_id'],
+                        "smiles": new_smiles_product,
+                        #"coords": original_product['coords'],
+                        "symbols": new_symbols_product,
+                        #"edges": original_product['edges']
+                    }
+                    new_reaction["products"].append(new_product)
             
             if 'additional_info' in reaction:
                 new_reaction['additional_info'] = reaction['additional_info']
