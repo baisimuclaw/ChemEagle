@@ -63,6 +63,52 @@ Clone the following repositories:
 ```
 git clone https://github.com/CYF2000127/ChemEagle
 ```
+
+### LLM backend selection
+
+ChemEAGLE now has one public entry supporting three language-model routes. The original
+no-argument behavior remains Azure OpenAI.
+
+```python
+from main import ChemEagle
+
+# ChatGPT/Codex subscription; authentication is owned by the Codex CLI.
+codex_result = ChemEagle("./examples/1.png", provider="codex")
+
+# Azure OpenAI; model is your Azure deployment name.
+azure_result = ChemEagle(
+    "./examples/1.png", provider="azure", model="YOUR-AZURE-DEPLOYMENT"
+)
+
+# A local vLLM/Ollama OpenAI-compatible endpoint.
+local_result = ChemEagle(
+    "./examples/1.png",
+    provider="local",
+    model="Qwen/Qwen3-VL-32B-Instruct-AWQ",
+    base_url="http://localhost:8000/v1",
+)
+```
+
+Codex setup does not require an OpenAI Platform API key:
+
+```bash
+npm install -g @openai/codex
+codex --version
+python -m chemeagle_llm.codex_auth login
+# On a headless supercomputer:
+python -m chemeagle_llm.codex_auth login --device-code
+python -m chemeagle_llm.codex_auth status
+```
+
+A ChatGPT/Codex subscription is not an OpenAI Platform API key. Codex mode consumes
+subscription capacity and never silently falls back to a paid API-key route.
+`ChemEagle_OS` remains a backward-compatible wrapper for `provider="local"`.
+
+See [the complete backend, deployment, authentication, environment-variable, output,
+and troubleshooting guide](docs/llm_backends.md), including RTX 3080, 48 GB GPU, and
+multi-GPU vLLM recommendations. Copy `.env.example` as a safe configuration template;
+never commit the resulting `.env`.
+
 #### Option A: Using Azure OpenAI (Cloud-based)
 
 1. First create and activate a [conda](https://numdifftools.readthedocs.io/en/stable/how-to/create_virtual_env_with_conda.html) environment with the following command in a Linux, Windows, or MacOS environment (Linux is the most recommended):
@@ -347,5 +393,4 @@ The input can be any chemical graphics; feel free to try more examples!
 ## :warning: Acknowledgement
 1. We use api_version="2024-10-21" with the HKUST Azure OpenAI endpoint as our official closed-source version.
 2. Our code is based on [MolNexTR](https://github.com/CYF2000127/MolNexTR), [MolScribe](https://github.com/thomas0809/MolScribe), [RxnIM](https://github.com/CYF2000127/RxnIM), [RxnScribe](https://github.com/thomas0809/RxNScribe), [ChemNER](https://github.com/Ozymandias314/ChemIENER), [ChemRxnExtractor](https://github.com/jiangfeng1124/ChemRxnExtractor), [AutoAgents](https://github.com/Link-AGI/AutoAgents), and [Azure OpenAI](https://azure.microsoft.com/).
-
 

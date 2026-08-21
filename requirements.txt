@@ -8,6 +8,7 @@ opencv-python-headless==4.5.4.60
 Pillow==9.5.0
 ipython
 openai
+jsonschema>=4.20
 albumentations==1.1.0
 matplotlib>=3.5.3
 SmilesPE==0.0.3

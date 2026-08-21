@@ -21,7 +21,14 @@ import urllib.parse
 from typing import List, Optional, Dict, Tuple
 import requests
 import os
-from openai import AzureOpenAI
+from chemeagle_llm import (
+    BackendConfig,
+    LLMRequest,
+    backend_model,
+    create_backend,
+    parse_json_content,
+    peek_active_backend,
+)
 
 
 API_KEY = os.getenv("API_KEY")
@@ -332,46 +339,53 @@ def _llm_symbol_to_smiles(symbol: str,
     Returns:
         SMILES string on success, None on failure
     """
-    # Use module-level config as defaults, then parameters, then environment variables
-    # Priority: function parameters > module variables > environment variables
-    # Within the same module, module-level variables can be accessed directly
+    backend = peek_active_backend()
+    owns_backend = False
+
+    # Preserve the legacy standalone Azure configuration when this helper is
+    # used outside a ChemEAGLE request scope.
     api_key = api_key or globals().get("API_KEY") or os.getenv("AZURE_OPENAI_API_KEY")
     api_endpoint = api_endpoint or globals().get("AZURE_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")
     api_version = api_version or globals().get("API_VERSION", "2024-10-21")
-    
-    # If there is no API_KEY or endpoint, silently return None (LLM not enabled)
-    if not api_key or not api_endpoint:
-        return None
+
+    if backend is None:
+        if not api_key or not api_endpoint:
+            return None
+        backend = create_backend(
+            config=BackendConfig(
+                provider="azure",
+                model=model,
+                api_key=api_key,
+                azure_endpoint=api_endpoint,
+                azure_api_version=api_version or "2024-10-21",
+            )
+        )
+        owns_backend = True
     
     try:
-        client = AzureOpenAI(
-            api_key=api_key,
-            api_version=api_version,
-            azure_endpoint=api_endpoint
-        )
-        
         # Load the prompt template
         prompt_template = _load_prompt_template(
             prompt_file or "prompt/prompt_symbol_to_smiles.txt"
         )
         prompt = prompt_template.format(symbol=symbol)
 
-        response = client.chat.completions.create(
-            model=model,
+        response = backend.generate(LLMRequest(
+            model=backend_model(backend, model),
             messages=[
                 {"role": "system", "content": "You are a professional cheminformatics assistant specialized in converting chemical symbols to SMILES format."},
                 {"role": "user", "content": prompt}
             ],
-            #temperature=0,
-            response_format={"type": "json_object"}
-        )
-        
-        content = response.choices[0].message.content.strip()
-        #print(f"content: {content}")
-        
-        # Parse the JSON output
+            json_mode=True,
+            output_schema={
+                "type": "object",
+                "properties": {"smiles": {"type": "string"}},
+                "required": ["smiles"],
+                "additionalProperties": False,
+            },
+        ))
+
+        result = parse_json_content(response)
         try:
-            result = json.loads(content)
             smiles = result.get("smiles", "").strip()
             
             if not smiles:
@@ -384,32 +398,21 @@ def _llm_symbol_to_smiles(symbol: str,
                     return smiles
             except Exception:
                 pass
-        except json.JSONDecodeError:
-            # If JSON parsing fails, try direct extraction (fault tolerance)
-            # Clean up possible markdown code block markers
-            if content.startswith("```"):
-                lines = content.split("\n")
-                content = "\n".join(lines[1:-1]) if len(lines) > 2 else content
-                content = content.strip()
-            
-            # Try to extract JSON (may be embedded in text)
-            json_match = re.search(r'\{[^}]*"smiles"[^}]*\}', content)
-            if json_match:
-                try:
-                    result = json.loads(json_match.group())
-                    smiles = result.get("smiles", "").strip()
-                    if smiles:
-                        mol = Chem.MolFromSmiles(smiles)
-                        if mol is not None:
-                            return smiles
-                except Exception:
-                    pass
+        except (AttributeError, TypeError):
+            return None
         
         return None
         
-    except Exception as e:
-        # Silent failure, return None
+    except Exception:
+        if not owns_backend:
+            # A request-scoped provider failure is actionable; do not disguise
+            # it as an unresolved chemical abbreviation.
+            raise
+        # Preserve the legacy optional standalone Azure fallback.
         return None
+    finally:
+        if owns_backend and backend is not None:
+            backend.close()
 
 
 
@@ -904,10 +907,10 @@ def get_smiles_from_symbol(symbol, mol,atom, bonds,
         if test_mol is not None:
             return smiles
     
-    # Final step: use a large language model (only enabled when API_KEY is configured)
+    # Final step: use the active ChemEAGLE backend, or legacy Azure config when standalone.
     if use_llm:
-        # Check whether there is usable API configuration (parameters, module variables, or environment variables)
-        has_api_config = (
+        has_backend = peek_active_backend() is not None
+        has_legacy_api_config = (
             llm_api_key or 
             llm_api_endpoint or 
             globals().get("API_KEY") or 
@@ -916,7 +919,7 @@ def get_smiles_from_symbol(symbol, mol,atom, bonds,
             os.getenv("AZURE_OPENAI_ENDPOINT")
         )
         
-        if has_api_config:
+        if has_backend or has_legacy_api_config:
             llm_smiles = _llm_symbol_to_smiles(
                 symbol, 
                 api_key=llm_api_key,

@@ -1,0 +1,23 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Codex/OpenAI authentication and local credentials
+.codex/
+auth.json
+*token*.json
+
+# Local model weights and generated extraction data
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+models/
+weights/
+outputs/
+results/
