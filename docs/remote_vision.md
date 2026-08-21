@@ -215,13 +215,25 @@ finally:
 One worker serializes requests, appropriate for one 8 GB 3060 Ti. For L40S batch
 parallelism, start several workers with separate Slurm GPU allocations.
 
-For long Codex extraction turns (large R-group tables or dense schemes), raise
-the normal turn timeout and enable stage tracing while validating a deployment:
+Codex uses a four-minute response window and retries the same request at most
+three times. Time spent inside a running vision tool is excluded from that
+window; the response timer restarts after the tool result reaches Codex. Enable
+stage tracing while validating a deployment:
 
 ```bash
-export CHEMEAGLE_LLM_TIMEOUT=900
+export CHEMEAGLE_LLM_TIMEOUT=240
+export CHEMEAGLE_LLM_MAX_RETRIES=3
 export CHEMEAGLE_TRACE=1
 ```
+
+Vision inference has a separate bounded fallback. RxnIM and molecule/coreference
+inference retry twice when a call succeeds but returns no detections (three total
+attempts). GPU, SSH, and Slurm exceptions still fail immediately. If all RxnIM
+attempts are empty, the image-aware LLM path continues with the empty result; an
+exhausted molecule/coreference call receives an empty schema instead of failing
+with an index error. Reaction-template tools retain the RxnIM prediction in their
+result; the common compact projection removes graph-heavy fields before it is
+sent to the LLM.
 
 `CHEMEAGLE_TRACE` reports only turn/tool identifiers, elapsed time, status, and
 tool-payload character counts. It does not print credentials or tool results.

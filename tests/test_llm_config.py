@@ -107,6 +107,11 @@ class BackendConfigTests(unittest.TestCase):
         self.assertEqual(config.timeout, 90)
         self.assertEqual(config.tool_timeout, 1234)
 
+    def test_codex_defaults_to_four_minute_response_window(self):
+        self.assertEqual(BackendConfig.from_env("codex", env={}).timeout, 240)
+        self.assertEqual(BackendConfig.from_env("azure", env={}).timeout, 180)
+        self.assertEqual(BackendConfig.from_env("codex", env={}).max_retries, 3)
+
     def test_credentials_are_validated_only_when_client_is_needed(self):
         backend = create_backend(config=BackendConfig(provider="azure", model="m"))
         with self.assertRaises(BackendConfigurationError):

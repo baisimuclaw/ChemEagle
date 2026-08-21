@@ -5,6 +5,7 @@ import json
 import numpy as np
 from PIL import Image
 import os
+import tempfile
 import base64
 from typing import Optional, Dict, Any
 
@@ -604,7 +605,15 @@ def _local_opsin_smiles(name: str) -> Optional[str]:
     except ImportError:
         return None
     try:
-        return _accept_opsin_smiles(py2opsin(name))
+        # py2opsin otherwise writes a fixed ``py2opsin_temp_input.txt`` in the
+        # current working directory.  A private temporary directory prevents
+        # concurrent calls from clobbering one another and keeps runtime files
+        # out of the source tree.
+        with tempfile.TemporaryDirectory(prefix="chemeagle-opsin-") as temp_dir:
+            temp_input = os.path.join(temp_dir, "input.txt")
+            return _accept_opsin_smiles(
+                py2opsin(name, tmp_fpath=temp_input)
+            )
     except Exception:
         return None
 

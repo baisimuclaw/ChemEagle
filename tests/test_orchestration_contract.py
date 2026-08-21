@@ -6,12 +6,15 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import types
 import unittest
 from unittest import mock
 
 import main
+import get_molecular_agent
 import get_reaction_agent
 import get_text_agent
+from chemietoolkit import helper as chemistry_helper
 from chemeagle_vision.request_cache import (
     caching_molecular_tool,
     compact_vision_tool_value,
@@ -84,6 +87,97 @@ class ImportAndOrchestrationTests(unittest.TestCase):
         self.assertIs(cache["raw_prediction"], raw)
         self.assertEqual(summary["reactants"][0]["smiles"], "C")
         self.assertEqual(cached_summary, summary)
+
+    def test_reaction_prediction_retries_two_empty_results_then_succeeds(self):
+        raw = [{"reactants": [], "conditions": [], "products": []}]
+        with mock.patch.object(
+            get_reaction_agent.model1,
+            "predict_image_file",
+            side_effect=[[], None, raw],
+        ) as predict:
+            result = get_reaction_agent._predict_reaction_with_empty_retries(
+                "input.png"
+            )
+
+        self.assertIs(result, raw)
+        self.assertEqual(predict.call_count, 3)
+
+    def test_reaction_tool_caches_final_empty_result_after_three_attempts(self):
+        cache = {}
+        with mock.patch.object(
+            get_reaction_agent.model1,
+            "predict_image_file",
+            return_value=[],
+        ) as predict:
+            tool = get_reaction_agent._caching_reaction_tool(cache)
+            self.assertEqual(tool("input.png"), {})
+            self.assertEqual(tool("input.png"), {})
+
+        self.assertEqual(predict.call_count, 3)
+        self.assertEqual(cache["raw_prediction"], [])
+
+    def test_reaction_prediction_does_not_hide_inference_errors(self):
+        with mock.patch.object(
+            get_reaction_agent.model1,
+            "predict_image_file",
+            side_effect=RuntimeError("GPU unavailable"),
+        ) as predict:
+            with self.assertRaisesRegex(RuntimeError, "GPU unavailable"):
+                get_reaction_agent._predict_reaction_with_empty_retries(
+                    "input.png"
+                )
+
+        predict.assert_called_once()
+
+    def test_molecular_prediction_retries_empty_detections_then_succeeds(self):
+        raw = [{"bboxes": [{"smiles": "C"}], "corefs": []}]
+        converted_image = object()
+        with (
+            mock.patch.object(get_molecular_agent.Image, "open") as open_image,
+            mock.patch.object(
+                get_molecular_agent.model,
+                "extract_molecule_corefs_from_figures",
+                side_effect=[[], [{"bboxes": [], "corefs": []}], raw],
+            ) as predict,
+        ):
+            open_image.return_value.convert.return_value = converted_image
+            result = get_molecular_agent._predict_molecular("input.png")
+
+        self.assertIs(result, raw)
+        self.assertEqual(predict.call_count, 3)
+        predict.assert_called_with([converted_image])
+
+    def test_molecular_prediction_returns_safe_schema_after_three_empty_results(self):
+        with (
+            mock.patch.object(get_molecular_agent.Image, "open") as open_image,
+            mock.patch.object(
+                get_molecular_agent.model,
+                "extract_molecule_corefs_from_figures",
+                return_value=[],
+            ) as predict,
+        ):
+            open_image.return_value.convert.return_value = object()
+            result = get_molecular_agent._predict_molecular("input.png")
+
+        self.assertEqual(predict.call_count, 3)
+        self.assertEqual(result, [{"bboxes": [], "corefs": []}])
+
+    def test_local_opsin_uses_an_isolated_temporary_input(self):
+        observed = {}
+
+        def fake_py2opsin(name, *, tmp_fpath):
+            observed["name"] = name
+            observed["path"] = Path(tmp_fpath)
+            self.assertTrue(observed["path"].parent.is_dir())
+            return "CC"
+
+        fake_module = types.SimpleNamespace(py2opsin=fake_py2opsin)
+        with mock.patch.dict(sys.modules, {"py2opsin": fake_module}):
+            result = chemistry_helper._local_opsin_smiles("ethane")
+
+        self.assertEqual(result, "CC")
+        self.assertEqual(observed["name"], "ethane")
+        self.assertFalse(observed["path"].parent.exists())
 
     def test_molecular_tool_reuses_raw_prediction_without_stripping_graph(self):
         raw = [
@@ -200,6 +294,26 @@ class ImportAndOrchestrationTests(unittest.TestCase):
                     "extract_molecule_corefs_from_figures",
                     function_source,
                 )
+
+    def test_reaction_template_tools_deliver_retried_rxnim_prediction(self):
+        source = (ROOT / "get_R_group_sub_agent.py").read_text(encoding="utf-8")
+        functions = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.parse(source).body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for variant in (
+            "get_full_reaction_template",
+            "get_full_reaction_template_OS",
+        ):
+            with self.subTest(variant=variant):
+                function_source = functions[variant]
+                self.assertIn(
+                    "_predict_reaction_with_empty_retries",
+                    function_source,
+                )
+                self.assertIn('"reaction_prediction": raw_prediction', function_source)
+                self.assertNotIn("model1.predict_image_file", function_source)
 
     def test_import_main_without_api_environment_or_heavy_models(self):
         env = dict(os.environ)

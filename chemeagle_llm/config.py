@@ -60,7 +60,8 @@ class BackendConfig:
                 "CHEMEAGLE_LLM_PROVIDER must be one of: azure, codex, local"
             )
 
-        timeout = float(values.get("CHEMEAGLE_LLM_TIMEOUT", "180"))
+        default_timeout = "240" if selected == "codex" else "180"
+        timeout = float(values.get("CHEMEAGLE_LLM_TIMEOUT", default_timeout))
         tool_timeout = float(values.get("CHEMEAGLE_LLM_TOOL_TIMEOUT", "3600"))
         retries = int(values.get("CHEMEAGLE_LLM_MAX_RETRIES", "3"))
         common_model = model or values.get("CHEMEAGLE_LLM_MODEL")

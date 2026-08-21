@@ -33,6 +33,29 @@ from chemeagle_vision.request_cache import (
 )
 
 
+MOLECULAR_EMPTY_MAX_ATTEMPTS = 3
+
+
+def _has_molecular_detections(raw_prediction) -> bool:
+    return bool(raw_prediction) and any(
+        isinstance(item, dict) and bool(item.get("bboxes"))
+        for item in raw_prediction
+    )
+
+
+def _empty_molecular_result(raw_prediction) -> list:
+    """Normalize an exhausted empty result to the schema expected downstream."""
+    if (
+        isinstance(raw_prediction, list)
+        and raw_prediction
+        and isinstance(raw_prediction[0], dict)
+    ):
+        raw_prediction[0].setdefault("bboxes", [])
+        raw_prediction[0].setdefault("corefs", [])
+        return raw_prediction
+    return [{"bboxes": [], "corefs": []}]
+
+
 
 def _ga_bbox_iou(a, b) -> float:
     """Intersection-over-union of two ``[x1, y1, x2, y2]`` boxes."""
@@ -83,10 +106,32 @@ def _run_image_tool_agent(backend, image_path, messages, tools, model_name, hand
     return [parse_json_content(response)]
 
 
-def _predict_molecular(image_path: str) -> list:
-    """Run molecule/coreference vision inference once and retain its full result."""
+def _predict_molecular(
+    image_path: str,
+    *,
+    max_attempts: int = MOLECULAR_EMPTY_MAX_ATTEMPTS,
+) -> list:
+    """Retry empty molecule/coreference inference and retain the full result."""
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
     image = Image.open(image_path).convert("RGB")
-    return model.extract_molecule_corefs_from_figures([image])
+    raw_prediction = None
+    for attempt in range(1, max_attempts + 1):
+        raw_prediction = model.extract_molecule_corefs_from_figures([image])
+        if _has_molecular_detections(raw_prediction):
+            return raw_prediction
+        if attempt < max_attempts:
+            print(
+                "Warning: molecule/coreference vision returned no detections "
+                f"(attempt {attempt}/{max_attempts}); retrying."
+            )
+
+    print(
+        "Warning: molecule/coreference vision returned no detections after "
+        f"{max_attempts} attempts; continuing with an empty structured result."
+    )
+    return _empty_molecular_result(raw_prediction)
 
 
 def _caching_molecular_tool(cache):

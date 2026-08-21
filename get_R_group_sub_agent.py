@@ -6,7 +6,13 @@ import numpy as np
 from PIL import Image
 import json
 from get_molecular_agent import process_reaction_image_with_multiple_products_and_text_correctR, process_reaction_image_with_multiple_products_and_text_correctmultiR, process_reaction_image_with_multiple_products_and_text_correctmultiR_OS
-from get_reaction_agent import get_reaction_withatoms_correctR, get_reaction_withatoms_correctR_OS, get_reaction_con, get_reaction_con_OS
+from get_reaction_agent import (
+    _predict_reaction_with_empty_retries,
+    get_reaction_withatoms_correctR,
+    get_reaction_withatoms_correctR_OS,
+    get_reaction_con,
+    get_reaction_con_OS,
+)
 import sys
 import json
 import base64
@@ -844,7 +850,7 @@ def get_reaction_full(image_path: str) -> dict:
     including only reactants, conditions, and products with their smiles, bbox, or text.
     '''
     image_file = image_path
-    raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+    raw_prediction = _predict_reaction_with_empty_retries(image_file)
     #raw_prediction = get_reaction_withatoms_correctR(image_path)
     return raw_prediction
 
@@ -952,7 +958,7 @@ def get_full_reaction_template(image_path: str) -> dict:
     '''
     image = Image.open(image_path).convert('RGB')
     image_file = image_path
-    raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+    raw_prediction = _predict_reaction_with_empty_retries(image_file)
     ####################raw_prediction = get_reaction_withatoms_correctR(image_path)###############################################################################################
     for reaction in raw_prediction:
         for section in ("reactants", "products", "conditions"):
@@ -981,7 +987,7 @@ def get_full_reaction_template(image_path: str) -> dict:
     parsed = parse_coref_data_with_fallback(data)
 
     combined_result = {
-        #"reaction_prediction": raw_prediction,  # is a list
+        "reaction_prediction": raw_prediction,  # compacted before LLM delivery
         "molecule_coref": parsed               # structured molecule recognition result
     }
     print(f"combined_result:{combined_result}")
@@ -994,7 +1000,7 @@ def get_full_reaction_template_OS(image_path: str) -> dict:
     '''
     image = Image.open(image_path).convert('RGB')
     image_file = image_path
-    raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+    raw_prediction = _predict_reaction_with_empty_retries(image_file)
     ####################raw_prediction = get_reaction_withatoms_correctR(image_path)###############################################################################################
     for reaction in raw_prediction:
         for section in ("reactants", "products", "conditions"):
@@ -1023,7 +1029,7 @@ def get_full_reaction_template_OS(image_path: str) -> dict:
     parsed = parse_coref_data_with_fallback(data)
 
     combined_result = {
-        #"reaction_prediction": raw_prediction,  # is a list
+        "reaction_prediction": raw_prediction,  # compacted before LLM delivery
         "molecule_coref": parsed               # structured molecule recognition result
     }
     print(f"combined_result:{combined_result}")

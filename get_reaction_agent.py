@@ -23,6 +23,43 @@ from chemeagle_llm import (
 from chemeagle_vision.proxies import vision_rxnim as model1
 
 
+REACTION_EMPTY_MAX_ATTEMPTS = 3
+
+
+def _predict_reaction_with_empty_retries(
+    image_path: str,
+    *,
+    max_attempts: int = REACTION_EMPTY_MAX_ATTEMPTS,
+):
+    """Retry RxnIM only when inference succeeds but detects no reaction.
+
+    Exceptions deliberately propagate unchanged.  After the final empty result,
+    return an empty list so the existing image-aware LLM fallback can continue.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    for attempt in range(1, max_attempts + 1):
+        raw_prediction = model1.predict_image_file(
+            image_path,
+            molnextr=True,
+            ocr=True,
+        )
+        if raw_prediction:
+            return raw_prediction
+        if attempt < max_attempts:
+            print(
+                "Warning: RxnIM returned no reaction "
+                f"(attempt {attempt}/{max_attempts}); retrying."
+            )
+
+    print(
+        "Warning: RxnIM returned no reaction after "
+        f"{max_attempts} attempts; continuing with the LLM image fallback."
+    )
+    return []
+
+
 
 def _run_image_tool_agent(
     backend,
@@ -82,7 +119,7 @@ def get_reaction(image_path: str) -> dict:
     Returns a structured dictionary of reactions extracted from the image,
     including reactants, conditions, and products, with their smiles, text, and bbox.
     '''
-    raw_prediction = model1.predict_image_file(image_path, molnextr=True, ocr=True)
+    raw_prediction = _predict_reaction_with_empty_retries(image_path)
     return _reaction_summary_from_raw(raw_prediction)
 
 
@@ -90,8 +127,8 @@ def _caching_reaction_tool(cache):
     """Return a request-scoped tool that avoids redundant GPU inference."""
     def invoke(image_path: str) -> dict:
         if "raw_prediction" not in cache:
-            cache["raw_prediction"] = model1.predict_image_file(
-                image_path, molnextr=True, ocr=True
+            cache["raw_prediction"] = _predict_reaction_with_empty_retries(
+                image_path
             )
         return _reaction_summary_from_raw(cache["raw_prediction"])
 
@@ -105,7 +142,7 @@ def get_full_reaction(image_path: str) -> dict:
     including reactants, conditions, and products, with their smiles, text, and bbox.
     '''
     image_file = image_path
-    raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+    raw_prediction = _predict_reaction_with_empty_retries(image_file)
     for reaction in raw_prediction:
         for section in ("reactants", "products", "conditions"):
             for entry in reaction.get(section, []):
@@ -198,7 +235,7 @@ def get_reaction_withatoms(image_path: str) -> dict:
         including reactants, conditions, and products, with their smiles, text, and bbox.
         '''
         image_file = image_path
-        raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+        raw_prediction = _predict_reaction_with_empty_retries(image_file)
         return raw_prediction
     
     input2 = raw_prediction_cache.get("raw_prediction")
@@ -326,7 +363,7 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
         '''
 
         image_file = image_path
-        raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+        raw_prediction = _predict_reaction_with_empty_retries(image_file)
         return raw_prediction
     
     input2 = raw_prediction_cache.get("raw_prediction")
@@ -463,7 +500,7 @@ def get_reaction_withatoms_correctR_OS(
         '''
 
         image_file = image_path
-        raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+        raw_prediction = _predict_reaction_with_empty_retries(image_file)
         return raw_prediction
     
     input2 = raw_prediction_cache.get("raw_prediction")
@@ -531,7 +568,7 @@ def _tesseract_ocr_image(image_path: str) -> str:
 
 
 def get_reaction_c(image_path: str) -> dict:
-    raw_prediction = model1.predict_image_file(image_path, molnextr=True, ocr=True)
+    raw_prediction = _predict_reaction_with_empty_retries(image_path)
     conditions_per_reaction = []
     for reaction in raw_prediction:
         conds = reaction.get('conditions', [])

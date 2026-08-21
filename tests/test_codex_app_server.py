@@ -79,6 +79,8 @@ class _CodexScript:
         rate_limited=False,
         turn_texts=None,
         hold_turn=False,
+        hold_turns=0,
+        hold_tool_turns=0,
         overload_method=None,
         close_method=None,
         ignore_method=None,
@@ -90,6 +92,8 @@ class _CodexScript:
         self.rate_limited = rate_limited
         self.turn_texts = list(turn_texts or ['{"reactions": []}'])
         self.hold_turn = hold_turn
+        self.hold_turns = hold_turns
+        self.hold_tool_turns = hold_tool_turns
         self.overload_method = overload_method
         self.close_method = close_method
         self.ignore_method = ignore_method
@@ -101,6 +105,7 @@ class _CodexScript:
         self.dynamic_tools = []
         self.dynamic_reply = None
         self.turn_input = None
+        self.turn_inputs = []
         self.output_schema = None
 
     def send(self, message):
@@ -135,7 +140,8 @@ class _CodexScript:
         if "method" not in message:
             if message.get("id") == 900:
                 self.dynamic_reply = message.get("result")
-                self.finish_turn(f"turn-{self.turn_count}")
+                if self.turn_count > self.hold_tool_turns:
+                    self.finish_turn(f"turn-{self.turn_count}")
             return
         method = message["method"]
         if "id" not in message:  # initialized notification
@@ -220,6 +226,7 @@ class _CodexScript:
             self.turn_count += 1
             turn_id = f"turn-{self.turn_count}"
             self.turn_input = message["params"].get("input")
+            self.turn_inputs.append(self.turn_input)
             self.output_schema = message["params"].get("outputSchema")
             self.response(message, {"turn": {"id": turn_id, "status": "inProgress"}})
             if self.dynamic_tools:
@@ -236,7 +243,7 @@ class _CodexScript:
                         },
                     }
                 )
-            elif not self.hold_turn:
+            elif not self.hold_turn and self.turn_count > self.hold_turns:
                 self.finish_turn(turn_id)
         elif method == "turn/interrupt":
             self.interrupts.append(message["params"])
@@ -251,9 +258,21 @@ class _CodexScript:
 
 
 class CodexBackendTests(unittest.TestCase):
-    def make_backend(self, *, account_type="chatgpt", max_retries=1, **script_kwargs):
+    def make_backend(
+        self,
+        *,
+        account_type="chatgpt",
+        max_retries=1,
+        timeout=5,
+        tool_timeout=3600,
+        **script_kwargs,
+    ):
         config = BackendConfig(
-            provider="codex", model="available-model", timeout=5, max_retries=max_retries
+            provider="codex",
+            model="available-model",
+            timeout=timeout,
+            tool_timeout=tool_timeout,
+            max_retries=max_retries,
         )
         script = _CodexScript(account_type=account_type, **script_kwargs)
         process = _FakeProcess(script)
@@ -276,7 +295,7 @@ class CodexBackendTests(unittest.TestCase):
             with self.assertRaises(BackendProcessError):
                 client._check_version()
 
-    def test_dynamic_tools_use_the_separate_long_timeout(self):
+    def test_dynamic_tools_use_response_window_not_tool_execution_cap(self):
         config = BackendConfig(
             provider="codex", model="available-model", timeout=5, tool_timeout=1234
         )
@@ -288,7 +307,20 @@ class CodexBackendTests(unittest.TestCase):
                 {},
             )
         self.assertIs(result, mock.sentinel.response)
-        self.assertEqual(run.call_args.args[0].timeout, 1234)
+        self.assertEqual(run.call_args.args[0].timeout, 5)
+
+    def test_non_tool_server_requests_remain_safely_denied(self):
+        client = CodexAppServerClient(
+            BackendConfig(provider="codex"),
+            process=mock.Mock(),
+        )
+        with mock.patch.object(client, "_send_result") as send_result:
+            client._handle_server_request_sync(
+                {"id": 7, "method": "applyPatchApproval", "params": {}}
+            )
+
+        self.assertEqual(send_result.call_args.args[0], 7)
+        self.assertIn("denied", send_result.call_args.args[1]["decision"])
 
     def test_managed_spawn_uses_stdio_controlled_cwd_and_strips_api_keys(self):
         captured = {}
@@ -437,6 +469,110 @@ class CodexBackendTests(unittest.TestCase):
             self.assertEqual(json.loads(response.content), {"reactions": []})
             payload = json.loads(script.dynamic_reply["contentItems"][0]["text"])
             self.assertEqual(payload, {"model": "available-model"})
+        finally:
+            backend.close()
+
+    def test_tool_execution_pauses_response_window(self):
+        backend, script = self.make_backend(
+            timeout=0.05,
+            tool_timeout=1,
+        )
+
+        def slow_lookup(**_arguments):
+            time.sleep(0.12)
+            return {"status": "ok"}
+
+        try:
+            response = backend.run_tool_loop(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "Use lookup"}],
+                    json_mode=True,
+                ),
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                executor={"lookup": slow_lookup},
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertEqual(script.turn_count, 1)
+            self.assertEqual(script.interrupts, [])
+        finally:
+            backend.close()
+
+    def test_timeout_retries_original_request_three_times(self):
+        backend, script = self.make_backend(
+            max_retries=3,
+            timeout=0.04,
+            hold_turns=2,
+        )
+        try:
+            response = backend.generate(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "same request"}],
+                    json_mode=True,
+                )
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertEqual(script.turn_count, 3)
+            self.assertEqual(len(script.interrupts), 2)
+            self.assertTrue(
+                all(value == script.turn_inputs[0] for value in script.turn_inputs)
+            )
+        finally:
+            backend.close()
+
+    def test_third_timeout_exits_and_identical_tool_call_is_cached(self):
+        backend, script = self.make_backend(
+            max_retries=3,
+            timeout=0.03,
+            hold_turn=True,
+        )
+        try:
+            with self.assertRaises(BackendTimeoutError):
+                backend.generate(
+                    LLMRequest(messages=[{"role": "user", "content": "never"}])
+                )
+            self.assertEqual(script.turn_count, 3)
+            self.assertEqual(len(script.interrupts), 3)
+        finally:
+            backend.close()
+
+        handler = mock.Mock(return_value={"status": "cached"})
+        backend, script = self.make_backend(
+            max_retries=2,
+            timeout=0.04,
+            hold_tool_turns=1,
+        )
+        try:
+            response = backend.run_tool_loop(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "Use lookup"}],
+                    json_mode=True,
+                ),
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"value": {"type": "integer"}},
+                            },
+                        },
+                    }
+                ],
+                executor={"lookup": handler},
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertEqual(script.turn_count, 2)
+            self.assertEqual(len(script.interrupts), 1)
+            handler.assert_called_once_with(value=3)
         finally:
             backend.close()
 

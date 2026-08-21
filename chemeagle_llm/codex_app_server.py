@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
@@ -110,6 +111,8 @@ class CodexAppServerClient:
         self._stderr_thread: Optional[threading.Thread] = None
         self._tool_executor: Optional[Mapping[str, Any]] = None
         self._tool_lock = threading.Lock()
+        self._turn_activity_lock = threading.Lock()
+        self._turn_activity: Dict[str, Dict[str, Any]] = {}
         self._workspace: Optional[tempfile.TemporaryDirectory[str]] = None
 
     @property
@@ -391,44 +394,11 @@ class CodexAppServerClient:
         request_id = message.get("id")
         params = message.get("params") or {}
         if method == "item/tool/call":
-            with self._tool_lock:
-                executor = self._tool_executor
-            tool_name = params.get("tool")
-            handler = executor.get(tool_name) if executor is not None else None
-            if handler is None:
-                self._send_result(
-                    request_id,
-                    tool_result(f"Unknown or disallowed tool: {tool_name}", success=False),
-                )
-                return
-            arguments = params.get("arguments")
-            if not isinstance(arguments, dict):
-                self._send_result(
-                    request_id,
-                    tool_result("Tool arguments must be a JSON object", success=False),
-                )
-                return
-            started_at = time.monotonic()
-            _trace(f"tool/start name={tool_name}")
             try:
-                result = handler(**arguments)
-                text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-                _trace(
-                    f"tool/complete name={tool_name} elapsed={time.monotonic() - started_at:.3f}s "
-                    f"payload_chars={len(text)}"
-                )
-                self._send_result(request_id, tool_result(text, success=True))
-            except Exception as exc:
-                _trace(
-                    f"tool/error name={tool_name} elapsed={time.monotonic() - started_at:.3f}s "
-                    f"type={type(exc).__name__}"
-                )
-                self._send_result(
-                    request_id,
-                    tool_result(
-                        f"Tool failed: {type(exc).__name__}: {exc}", success=False
-                    ),
-                )
+                self._mark_tool_started(str(params.get("turnId") or ""))
+                self._execute_tool_call(request_id, params)
+            finally:
+                self._mark_tool_finished(str(params.get("turnId") or ""))
             return
 
         if method in {"applyPatchApproval", "execCommandApproval"}:
@@ -447,6 +417,101 @@ class CodexAppServerClient:
             self._send_result(request_id, {"unixTimestampMs": int(time.time() * 1000)})
         else:
             self._send_error(request_id, -32601, f"Unsupported server request: {method}")
+
+    def _execute_tool_call(self, request_id: Any, params: Dict[str, Any]) -> None:
+        with self._tool_lock:
+            executor = self._tool_executor
+        tool_name = params.get("tool")
+        handler = executor.get(tool_name) if executor is not None else None
+        if handler is None:
+            self._send_result(
+                request_id,
+                tool_result(f"Unknown or disallowed tool: {tool_name}", success=False),
+            )
+            _trace(f"tool/result-sent name={tool_name} success=false reason=unknown-tool")
+            return
+        arguments = params.get("arguments")
+        if not isinstance(arguments, dict):
+            self._send_result(
+                request_id,
+                tool_result("Tool arguments must be a JSON object", success=False),
+            )
+            _trace(f"tool/result-sent name={tool_name} success=false reason=invalid-arguments")
+            return
+        started_at = time.monotonic()
+        _trace(f"tool/start name={tool_name}")
+        try:
+            result = handler(**arguments)
+            text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+            _trace(
+                f"tool/complete name={tool_name} elapsed={time.monotonic() - started_at:.3f}s "
+                f"payload_chars={len(text)}"
+            )
+            self._send_result(request_id, tool_result(text, success=True))
+            _trace(f"tool/result-sent name={tool_name} success=true")
+        except Exception as exc:
+            _trace(
+                f"tool/error name={tool_name} elapsed={time.monotonic() - started_at:.3f}s "
+                f"type={type(exc).__name__}"
+            )
+            self._send_result(
+                request_id,
+                tool_result(
+                    f"Tool failed: {type(exc).__name__}: {exc}", success=False
+                ),
+            )
+            _trace(f"tool/result-sent name={tool_name} success=false reason=tool-error")
+
+    def register_turn_activity(self, turn_id: str) -> None:
+        now = time.monotonic()
+        with self._turn_activity_lock:
+            self._turn_activity.setdefault(
+                turn_id,
+                {"active_tools": 0, "active_since": None, "last_activity": now},
+            )
+
+    def _mark_tool_started(self, turn_id: str) -> None:
+        if not turn_id:
+            return
+        now = time.monotonic()
+        with self._turn_activity_lock:
+            state = self._turn_activity.setdefault(
+                turn_id,
+                {"active_tools": 0, "active_since": None, "last_activity": now},
+            )
+            if not state["active_tools"]:
+                state["active_since"] = now
+            state["active_tools"] += 1
+            state["last_activity"] = now
+
+    def _mark_tool_finished(self, turn_id: str) -> None:
+        if not turn_id:
+            return
+        now = time.monotonic()
+        with self._turn_activity_lock:
+            state = self._turn_activity.get(turn_id)
+            if state is None:
+                return
+            state["active_tools"] = max(0, state["active_tools"] - 1)
+            state["last_activity"] = now
+            if not state["active_tools"]:
+                state["active_since"] = None
+
+    def turn_activity(self, turn_id: str) -> Tuple[int, float, Optional[float]]:
+        now = time.monotonic()
+        with self._turn_activity_lock:
+            state = self._turn_activity.get(turn_id)
+            if state is None:
+                return 0, now, None
+            return (
+                int(state["active_tools"]),
+                float(state["last_activity"]),
+                state["active_since"],
+            )
+
+    def clear_turn_activity(self, turn_id: str) -> None:
+        with self._turn_activity_lock:
+            self._turn_activity.pop(turn_id, None)
 
     def account(self, *, refresh: bool = False) -> Dict[str, Any]:
         return self.request("account/read", {"refreshToken": refresh})
@@ -631,32 +696,50 @@ class CodexAppServerBackend(BaseLLMBackend):
         turn_id: str,
         after: int,
         timeout: float,
+        tool_timeout: Optional[float] = None,
         cancel_event: Any = None,
     ) -> Dict[str, Any]:
-        deadline = time.monotonic() + timeout
+        last_activity = time.monotonic()
+
+        def interrupt() -> None:
+            try:
+                self.client.request(
+                    "turn/interrupt",
+                    {"threadId": thread_id, "turnId": turn_id},
+                    timeout=min(5.0, timeout),
+                    retry_overload=False,
+                )
+            except BackendProcessError:
+                pass
+
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 try:
-                    self.client.request(
-                        "turn/interrupt",
-                        {"threadId": thread_id, "turnId": turn_id},
-                        timeout=min(5.0, timeout),
-                        retry_overload=False,
-                    )
+                    interrupt()
                 finally:
                     raise BackendCancelledError("Codex turn was cancelled")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                try:
-                    self.client.request(
-                        "turn/interrupt",
-                        {"threadId": thread_id, "turnId": turn_id},
-                        timeout=5.0,
-                        retry_overload=False,
+
+            active_tools, activity_at, active_since = self.client.turn_activity(turn_id)
+            last_activity = max(last_activity, activity_at)
+            now = time.monotonic()
+            if active_tools:
+                if (
+                    tool_timeout is not None
+                    and active_since is not None
+                    and now - active_since >= tool_timeout
+                ):
+                    interrupt()
+                    raise ToolExecutionError(
+                        f"Codex dynamic tool did not finish within {tool_timeout:g}s"
                     )
-                except BackendProcessError:
-                    pass
-                raise BackendTimeoutError("Timed out waiting for Codex turn completion")
+                remaining = 0.2
+            else:
+                remaining = timeout - (now - last_activity)
+            if remaining <= 0:
+                interrupt()
+                raise BackendTimeoutError(
+                    f"Codex produced no turn completion within {timeout:g}s of its last tool activity"
+                )
             try:
                 return self.client.wait_notification(
                     "turn/completed",
@@ -665,7 +748,7 @@ class CodexAppServerBackend(BaseLLMBackend):
                         params.get("threadId") == thread_id
                         and (params.get("turn") or {}).get("id") == turn_id
                     ),
-                    timeout=min(0.2, remaining),
+                    timeout=min(0.2, max(remaining, 0.001)),
                 )
             except BackendTimeoutError:
                 continue
@@ -715,11 +798,15 @@ class CodexAppServerBackend(BaseLLMBackend):
             thread_id = thread.get("id")
             if not thread_id:
                 raise BackendProcessError("Codex thread/start returned no thread id")
+            _trace(
+                f"thread/start id={thread_id} model="
+                f"{started.get('model') or selected_model or 'default'}"
+            )
             output_schema = request.output_schema
             attempts = max(1, min(self.config.max_retries, 3))
+            correction_retry = False
             for attempt in range(attempts):
-                turn_inputs = inputs
-                if attempt:
+                if correction_retry:
                     turn_inputs = [
                         {
                             "type": "text",
@@ -729,6 +816,9 @@ class CodexAppServerBackend(BaseLLMBackend):
                             ),
                         }
                     ]
+                else:
+                    turn_inputs = inputs
+                correction_retry = False
                 turn_params: Dict[str, Any] = {
                     "threadId": thread_id,
                     "input": turn_inputs,
@@ -742,6 +832,7 @@ class CodexAppServerBackend(BaseLLMBackend):
                 turn_id = str((started_turn.get("turn") or {}).get("id") or "")
                 if not turn_id:
                     raise BackendProcessError("Codex turn/start returned no turn id")
+                self.client.register_turn_activity(turn_id)
                 turn_started_at = time.monotonic()
                 _trace(
                     f"turn/start id={turn_id} attempt={attempt + 1}/{attempts} "
@@ -753,14 +844,30 @@ class CodexAppServerBackend(BaseLLMBackend):
                         turn_id=turn_id,
                         after=cursor,
                         timeout=request.timeout or self.config.timeout,
+                        tool_timeout=self.config.tool_timeout if tools else None,
                         cancel_event=request.cancel_event,
                     )
+                except BackendTimeoutError as exc:
+                    _trace(
+                        f"turn/error id={turn_id} type={type(exc).__name__} "
+                        f"elapsed={time.monotonic() - turn_started_at:.3f}s"
+                    )
+                    if attempt + 1 < attempts:
+                        logger.warning(
+                            "Codex turn timed out; resubmitting the original request (%d/%d)",
+                            attempt + 2,
+                            attempts,
+                        )
+                        continue
+                    raise
                 except Exception as exc:
                     _trace(
                         f"turn/error id={turn_id} type={type(exc).__name__} "
                         f"elapsed={time.monotonic() - turn_started_at:.3f}s"
                     )
                     raise
+                finally:
+                    self.client.clear_turn_activity(turn_id)
                 turn = (completed.get("params") or {}).get("turn") or {}
                 status = turn.get("status")
                 _trace(
@@ -800,6 +907,7 @@ class CodexAppServerBackend(BaseLLMBackend):
                             logger.warning(
                                 "Codex returned invalid structured output; requesting correction"
                             )
+                            correction_retry = True
                             continue
                         raise
                 return response
@@ -819,13 +927,39 @@ class CodexAppServerBackend(BaseLLMBackend):
         executor: Mapping[str, Any],
     ) -> LLMResponse:
         schemas = tool_input_schemas(tools)
+        call_cache: Dict[str, Future[Any]] = {}
+        call_cache_lock = threading.Lock()
 
         def bind(name: str, handler: Any) -> Any:
             def invoke(**arguments: Any) -> Any:
                 schema = schemas.get(name)
                 if schema is not None:
                     validate_json_value(arguments, schema)
-                return handler(**arguments)
+                cache_key = name + ":" + json.dumps(
+                    arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                with call_cache_lock:
+                    future = call_cache.get(cache_key)
+                    owns_call = future is None
+                    if future is None:
+                        future = Future()
+                        call_cache[cache_key] = future
+                if owns_call:
+                    try:
+                        future.set_result(handler(**arguments))
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                        future.exception()
+                        with call_cache_lock:
+                            if call_cache.get(cache_key) is future:
+                                call_cache.pop(cache_key, None)
+                        raise
+                else:
+                    _trace(f"tool/cache-hit name={name}")
+                return future.result()
 
             return invoke
 
@@ -838,7 +972,7 @@ class CodexAppServerBackend(BaseLLMBackend):
             replace(
                 request,
                 tools=[],
-                timeout=request.timeout or self.config.tool_timeout,
+                timeout=request.timeout or self.config.timeout,
             ),
             tools=tools,
             executor=validated_executor,
