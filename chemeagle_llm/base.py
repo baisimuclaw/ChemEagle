@@ -22,6 +22,12 @@ def validate_json_value(value: Any, schema: Dict[str, Any]) -> None:
         try:
             jsonschema.validate(value, schema)
         except jsonschema.ValidationError as exc:  # type: ignore[attr-defined]
+            if exc.validator == "type":
+                expected = exc.validator_value
+                path = "$" + "".join(f"[{item!r}]" for item in exc.absolute_path)
+                raise InvalidResponseError(
+                    f"{path}: expected JSON {expected}, got {type(exc.instance).__name__}"
+                ) from exc
             raise InvalidResponseError(f"JSON schema validation failed: {exc.message}") from exc
         return
 

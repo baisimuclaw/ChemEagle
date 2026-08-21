@@ -90,6 +90,7 @@ class RemoteVisionBackend:
         if not remote_dir:
             raise VisionConfigurationError("Remote working directory is required")
         environment = [
+            "PYTHONNOUSERSITE=1",
             "CHEMEAGLE_OFFLINE=1" if self.config.offline else "CHEMEAGLE_OFFLINE=0",
             "HF_HUB_OFFLINE=1" if self.config.offline else "HF_HUB_OFFLINE=0",
             "TRANSFORMERS_OFFLINE=1" if self.config.offline else "TRANSFORMERS_OFFLINE=0",

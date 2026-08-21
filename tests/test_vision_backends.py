@@ -66,6 +66,7 @@ class VisionConfigTests(unittest.TestCase):
         self.assertIn("srun --quiet --unbuffered", remote)
         self.assertIn("--account xlzhang", remote)
         self.assertIn("--gres=gpu:L40S:1", remote)
+        self.assertIn("PYTHONNOUSERSITE=1", remote)
         self.assertIn("CHEMEAGLE_OFFLINE=1", remote)
         self.assertIn("chemeagle_vision.worker", remote)
         self.assertNotIn("OPENAI", remote)
