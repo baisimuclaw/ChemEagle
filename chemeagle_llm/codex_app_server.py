@@ -484,6 +484,14 @@ class CodexAppServerClient:
             for thread in (self._reader_thread, self._stderr_thread):
                 if thread is not None and thread is not current and thread.is_alive():
                     thread.join(timeout=1)
+            if process is not None:
+                for name in ("stdin", "stdout", "stderr"):
+                    stream = getattr(process, name, None)
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
 
 
 def _messages_to_codex_input(messages: Iterable[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:

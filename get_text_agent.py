@@ -1,6 +1,5 @@
 from PIL import Image
 import pytesseract
-from chemrxnextractor import RxnExtractor
 from typing import Optional
 from chemeagle_llm import (
     LLMRequest,
@@ -9,14 +8,16 @@ from chemeagle_llm import (
     get_active_backend,
     parse_json_content,
 )
-model_dir = "./cre_models_v0.1"
-rxn_extractor = RxnExtractor(model_dir)
 import json
 import base64
 import os
 import shutil
 import re
-from chemeagle_vision.proxies import vision_chemner as model2
+import sys
+from chemeagle_vision.proxies import (
+    vision_chemner as model2,
+    vision_chemrxnextractor as rxn_extractor,
+)
 
 
 # Configure Tesseract OCR path (Windows)
@@ -30,6 +31,8 @@ def configure_tesseract():
     # Common Windows installation paths (including custom paths under the project directory)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     possible_paths = [
+        # Isolated conda/virtual environment used by the orchestrator.
+        os.path.join(os.path.dirname(sys.executable), "tesseract"),
         # Custom path under the project directory
         os.path.join(script_dir, "Tesseract-OCR", "tesseract.exe"),
         os.path.join(os.path.dirname(script_dir), "Tesseract-OCR", "tesseract.exe"),
@@ -73,10 +76,6 @@ def configure_tesseract():
         "Tesseract OCR is not installed or not in PATH."
         "Please visit https://github.com/UB-Mannheim/tesseract/wiki for installation."
     )
-
-# Initialize Tesseract configuration
-configure_tesseract()
-
 
 def merge_sentences(sentences):
     """
@@ -154,9 +153,7 @@ def extract_reactions_from_text_in_image(image_path: str) -> dict:
         'reactions': reaction list output by RxnExtractor (list)
       }
     """
-    # Model directory and device parameters (adjust as needed)
-    model_dir = "./cre_models_v0.1"
-    device = "cpu"
+    configure_tesseract()
 
     # 1. OCR text extraction
     img = Image.open(image_path)
@@ -169,11 +166,7 @@ def extract_reactions_from_text_in_image(image_path: str) -> dict:
     # 3. Split text into sentences to avoid length issues
     sentences = split_text_into_sentences(paragraph)
     
-    # 4. Initialize chemical reaction extractor
-    use_cuda = (device.lower() == "cuda")
-    rxn_extractor = RxnExtractor(model_dir, use_cuda=use_cuda)
-
-    # 5. Extract reactions for each sentence (avoid length mismatch issues)
+    # 4. Extract reactions for each sentence on the active vision worker.
     all_reactions = []
     try:
         reactions = rxn_extractor.get_reactions(sentences)
@@ -193,9 +186,7 @@ def extract_reactions_from_text_in_image(image_path: str) -> dict:
     return all_reactions 
 
 def NER_from_text_in_image(image_path: str) -> dict:
-    # Model directory and device parameters (adjust as needed)
-    model_dir = "./cre_models_v0.1"
-    device = "cpu"
+    configure_tesseract()
 
     # 1. OCR text extraction
     img = Image.open(image_path)
@@ -205,11 +196,7 @@ def NER_from_text_in_image(image_path: str) -> dict:
     lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
     paragraph = " ".join(lines)
 
-    # 3. Initialize chemical reaction extractor
-    use_cuda = (device.lower() == "cuda")
-    rxn_extractor = RxnExtractor(model_dir, use_cuda=use_cuda)
-
-    # 4. Extract reactions (note: get_reactions requires list input)
+    # 3. Extract named entities on the active vision worker.
     predictions = model2.predict_strings([paragraph])
 
     return predictions 

@@ -2,6 +2,7 @@ pydantic==2.10.6
 numpy==1.26.4
 torch==2.2.0
 transformers==4.47.0
+einops>=0.7
 layoutparser[effdet]
 opencv-python==4.5.5.64
 opencv-python-headless==4.5.4.60

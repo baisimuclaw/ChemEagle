@@ -56,6 +56,14 @@ class ChemNERProxy:
         )
 
 
+class ChemRxnExtractorProxy:
+    def get_reactions(self, sentences: List[str]) -> Any:
+        return get_active_vision_backend().call(
+            "chemrxn_extract_sentences", {"sentences": sentences}
+        )
+
+
 vision_rxnim = RxnIMProxy()
 vision_toolkit = ChemIEToolkitProxy()
 vision_chemner = ChemNERProxy()
+vision_chemrxnextractor = ChemRxnExtractorProxy()

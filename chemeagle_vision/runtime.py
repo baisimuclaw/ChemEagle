@@ -24,6 +24,7 @@ class VisionRuntime:
             "molnextr_predict_images": self._molnextr_predict_images,
             "molnextr_convert_graph_to_output": self._molnextr_convert_graph_to_output,
             "chemner_predict_strings": self._chemner_predict_strings,
+            "chemrxn_extract_sentences": self._chemrxn_extract_sentences,
         }
         if config.offline:
             os.environ["CHEMEAGLE_OFFLINE"] = "1"
@@ -152,6 +153,16 @@ class VisionRuntime:
         if not isinstance(options, dict):
             raise VisionConfigurationError("ChemNER options must be a dictionary")
         return self.toolkit.chemner.predict_strings(strings, **options)
+
+    def _chemrxn_extract_sentences(self, params: Dict[str, Any]) -> Any:
+        sentences = params.get("sentences")
+        if not isinstance(sentences, list) or not all(
+            isinstance(value, str) for value in sentences
+        ):
+            raise VisionConfigurationError(
+                "chemrxn_extract_sentences requires a list of strings"
+            )
+        return self.toolkit.extract_reactions_from_strings(sentences)
 
 
 class LocalVisionBackend:

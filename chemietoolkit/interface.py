@@ -207,6 +207,9 @@ class ChemIEToolkit:
             )
         self._chemrxnextractor = ChemRxnExtractor("", None, ckpt_path, self.device.type)
 
+    def extract_reactions_from_strings(self, strings):
+        return self.chemrxnextractor.rxn_extractor.get_reactions(strings)
+
 
     @property
     def chemner(self):

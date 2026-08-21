@@ -12,6 +12,10 @@ Adapted from TF-ID model https://github.com/ai8hyf/TF-ID
 
 LARGE_MODEL_ID = "shixuanleong/visualheist-large" 
 BASE_MODEL_ID = "shixuanleong/visualheist-base" 
+MODEL_REVISIONS = {
+    LARGE_MODEL_ID: "6abe855bb198753a76e19cdec8ed5c2d3398907c",
+    BASE_MODEL_ID: "0e4464d1002b30f800e9d2a08a541ffa70b31b97",
+}
 LARGE_SAFETENSORS_PATH = "https://huggingface.co/shixuanleong/visualheist-large/resolve/main/model.safetensors" 
 BASE_SAFETENSORS_PATH = "https://huggingface.co/shixuanleong/visualheist-base/resolve/main/model.safetensors" 
 
@@ -90,12 +94,26 @@ def _create_model(model_id, base_or_large):
     package_dir = os.path.dirname(__file__)
     safetensors_filename = base_or_large + "_model.safetensors"
     safetensors_download_path = package_dir + "/../safetensors/" + safetensors_filename
+    revision = MODEL_REVISIONS[model_id]
     if not os.path.exists(safetensors_download_path):
-        safetensors_download_path = hf_hub_download(repo_id=model_id, filename="model.safetensors")
+        safetensors_download_path = hf_hub_download(
+            repo_id=model_id,
+            filename="model.safetensors",
+            revision=revision,
+        )
 
     state_dict = load_file(safetensors_download_path)
-    model = AutoModelForCausalLM.from_pretrained(model_id, state_dict=state_dict, trust_remote_code=True)
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        revision=revision,
+        state_dict=state_dict,
+        trust_remote_code=True,
+    )
+    processor = AutoProcessor.from_pretrained(
+        model_id,
+        revision=revision,
+        trust_remote_code=True,
+    )
     return model, processor
 
 

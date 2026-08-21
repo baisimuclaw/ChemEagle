@@ -17,7 +17,12 @@ from chemeagle_vision.codec import decode_value, encode_value
 from chemeagle_vision.config import VisionConfig
 from chemeagle_vision.context import vision_scope
 from chemeagle_vision.errors import VisionConfigurationError
-from chemeagle_vision.proxies import vision_chemner, vision_rxnim, vision_toolkit
+from chemeagle_vision.proxies import (
+    vision_chemner,
+    vision_chemrxnextractor,
+    vision_rxnim,
+    vision_toolkit,
+)
 from chemeagle_vision.remote import RemoteVisionBackend
 from chemeagle_vision.runtime import VisionRuntime
 from chemeagle_vision.worker import serve_stdio
@@ -147,6 +152,7 @@ class VisionProxyTests(unittest.TestCase):
                 )
                 vision_toolkit.molnextr.predict_images([])
                 vision_chemner.predict_strings(["ethanol"])
+                vision_chemrxnextractor.get_reactions(["ethanol reacted."])
         self.assertEqual(
             [call[0] for call in backend.calls],
             [
@@ -154,6 +160,7 @@ class VisionProxyTests(unittest.TestCase):
                 "extract_molecule_corefs",
                 "molnextr_predict_images",
                 "chemner_predict_strings",
+                "chemrxn_extract_sentences",
             ],
         )
 
@@ -210,6 +217,9 @@ class WorkerProtocolTests(unittest.TestCase):
             def extract_molecule_corefs_from_figures(self, figures, **options):
                 return [{"count": len(figures), "options": options}]
 
+            def extract_reactions_from_strings(self, strings):
+                return [{"count": len(strings)}]
+
         module = types.ModuleType("chemietoolkit")
         module.ChemIEToolkit = FakeToolkit
         runtime = VisionRuntime(VisionConfig(provider="local", device="cpu"))
@@ -220,6 +230,9 @@ class WorkerProtocolTests(unittest.TestCase):
                 "extract_molecule_corefs", {"figures": [image], "options": {}}
             )
             runtime.call("chemner_predict_strings", {"strings": ["EtOH"]})
+            runtime.call(
+                "chemrxn_extract_sentences", {"sentences": ["EtOH reacted."]}
+            )
         self.assertEqual(len(instances), 1)
 
 

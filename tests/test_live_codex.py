@@ -25,7 +25,7 @@ class LiveCodexSmokeTest(unittest.TestCase):
                     ],
                     output_schema={
                         "type": "object",
-                        "properties": {"ok": {"const": True}},
+                        "properties": {"ok": {"type": "boolean", "const": True}},
                         "required": ["ok"],
                         "additionalProperties": False,
                     },
