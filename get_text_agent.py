@@ -165,8 +165,8 @@ def filter_prose_sentences(text: str) -> list:
 
 
 def _text_model_sentences(text: str) -> list:
-    """Select text-model input, with an escape hatch for upstream behaviour."""
-    enabled = os.environ.get("CHEMEAGLE_TEXT_PROSE_FILTER", "1").strip().lower()
+    """Select text-model input; filtering is opt-in to preserve upstream input."""
+    enabled = os.environ.get("CHEMEAGLE_TEXT_PROSE_FILTER", "0").strip().lower()
     if enabled in {"0", "false", "no", "off"}:
         return split_text_into_sentences(text)
     return filter_prose_sentences(text)

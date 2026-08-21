@@ -251,6 +251,7 @@ class CodexAppServerClient:
                 elif "id" in message and "method" in message:
                     self._handle_server_request(message)
                 elif "method" in message:
+                    self._mark_notification_activity(message)
                     with self._event_condition:
                         self._events.append(message)
                         if len(self._events) > 10000:
@@ -469,6 +470,26 @@ class CodexAppServerClient:
                 turn_id,
                 {"active_tools": 0, "active_since": None, "last_activity": now},
             )
+
+    def _mark_notification_activity(self, message: Dict[str, Any]) -> None:
+        """Reset a turn's silence window when App Server reports progress."""
+        params = message.get("params") or {}
+        turn_id = params.get("turnId") or params.get("turn_id")
+        for key in ("turn", "item"):
+            nested = params.get(key)
+            if not turn_id and isinstance(nested, dict):
+                turn_id = nested.get("turnId") or nested.get("turn_id")
+                if key == "turn":
+                    turn_id = turn_id or nested.get("id")
+        if not turn_id:
+            return
+        now = time.monotonic()
+        with self._turn_activity_lock:
+            state = self._turn_activity.setdefault(
+                str(turn_id),
+                {"active_tools": 0, "active_since": None, "last_activity": now},
+            )
+            state["last_activity"] = now
 
     def _mark_tool_started(self, turn_id: str) -> None:
         if not turn_id:
@@ -738,7 +759,7 @@ class CodexAppServerBackend(BaseLLMBackend):
             if remaining <= 0:
                 interrupt()
                 raise BackendTimeoutError(
-                    f"Codex produced no turn completion within {timeout:g}s of its last tool activity"
+                    f"Codex produced no turn completion within {timeout:g}s of its last recorded activity"
                 )
             try:
                 return self.client.wait_notification(

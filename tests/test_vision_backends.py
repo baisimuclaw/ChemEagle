@@ -45,6 +45,7 @@ class VisionConfigTests(unittest.TestCase):
         self.assertTrue(config.offline)
         self.assertEqual(config.slurm_account, "xlzhang")
         self.assertEqual(config.slurm_submit_host, "sandbox")
+        self.assertEqual(config.slurm_memory, "24G")
 
     def test_remote_requires_host_and_directory(self):
         config = VisionConfig(provider="ssh", ssh_host="worker")
@@ -102,6 +103,24 @@ class VisionConfigTests(unittest.TestCase):
         )
         command = RemoteVisionBackend(config).ssh_command()
         self.assertEqual(command[command.index("-F") + 1], os.path.expanduser("~/.ssh/config"))
+
+    def test_remote_stderr_can_be_persisted_locally(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = os.path.join(temporary, "remote.log")
+            backend = RemoteVisionBackend(
+                VisionConfig(
+                    provider="ssh",
+                    ssh_host="worker",
+                    remote_dir="/srv/ChemEagle",
+                    remote_log=log_path,
+                )
+            )
+
+            backend._append_remote_log("model diagnostic")
+
+            with open(log_path, "r", encoding="utf-8") as handle:
+                value = handle.read()
+            self.assertIn("model diagnostic", value)
 
 
 class VisionCodecTests(unittest.TestCase):

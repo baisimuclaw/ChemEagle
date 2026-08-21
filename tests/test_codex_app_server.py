@@ -505,6 +505,23 @@ class CodexBackendTests(unittest.TestCase):
         finally:
             backend.close()
 
+    def test_turn_notification_refreshes_silence_window(self):
+        client = object.__new__(CodexAppServerClient)
+        client._turn_activity_lock = threading.Lock()
+        client._turn_activity = {
+            "turn-1": {
+                "active_tools": 0,
+                "active_since": None,
+                "last_activity": 0.0,
+            }
+        }
+
+        client._mark_notification_activity(
+            {"method": "item/updated", "params": {"turnId": "turn-1"}}
+        )
+
+        self.assertGreater(client._turn_activity["turn-1"]["last_activity"], 0.0)
+
     def test_timeout_retries_original_request_three_times(self):
         backend, script = self.make_backend(
             max_retries=3,

@@ -107,6 +107,17 @@ class BackendConfigTests(unittest.TestCase):
         self.assertEqual(config.timeout, 90)
         self.assertEqual(config.tool_timeout, 1234)
 
+    def test_final_synthesis_uses_upstream_compatible_timeout(self):
+        self.assertEqual(
+            BackendConfig.from_env("codex", env={}).synthesis_timeout,
+            600,
+        )
+        configured = BackendConfig.from_env(
+            "codex",
+            env={"CHEMEAGLE_LLM_SYNTHESIS_TIMEOUT": "720"},
+        )
+        self.assertEqual(configured.synthesis_timeout, 720)
+
     def test_codex_defaults_to_four_minute_response_window(self):
         self.assertEqual(BackendConfig.from_env("codex", env={}).timeout, 240)
         self.assertEqual(BackendConfig.from_env("azure", env={}).timeout, 180)

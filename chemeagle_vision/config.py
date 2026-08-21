@@ -46,8 +46,9 @@ class VisionConfig:
     slurm_gpu_type: str = "L40S"
     slurm_gpus: int = 1
     slurm_cpus: int = 8
-    slurm_memory: str = "64G"
+    slurm_memory: str = "24G"
     slurm_time: str = "08:00:00"
+    remote_log: Optional[str] = None
 
     @classmethod
     def from_env(
@@ -100,8 +101,9 @@ class VisionConfig:
             slurm_gpu_type=values.get("CHEMEAGLE_VISION_SLURM_GPU_TYPE", "L40S"),
             slurm_gpus=int(values.get("CHEMEAGLE_VISION_SLURM_GPUS", "1")),
             slurm_cpus=int(values.get("CHEMEAGLE_VISION_SLURM_CPUS", "8")),
-            slurm_memory=values.get("CHEMEAGLE_VISION_SLURM_MEMORY", "64G"),
+            slurm_memory=values.get("CHEMEAGLE_VISION_SLURM_MEMORY", "24G"),
             slurm_time=values.get("CHEMEAGLE_VISION_SLURM_TIME", "08:00:00"),
+            remote_log=values.get("CHEMEAGLE_VISION_REMOTE_LOG"),
         )
         for key, value in overrides.items():
             if value is not None:

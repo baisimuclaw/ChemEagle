@@ -114,6 +114,12 @@ timeout is separate from an ordinary LLM turn and defaults to one hour. Override
 with `CHEMEAGLE_LLM_TOOL_TIMEOUT` when cluster queue/startup policy requires a larger
 value; `CHEMEAGLE_LLM_TIMEOUT` continues to control ordinary turns.
 
+The final Data Structure Agent preserves the upstream full-resolution image, original
+prompt, and complete successful-agent payload. Its silence window defaults to 600
+seconds (`CHEMEAGLE_LLM_SYNTHESIS_TIMEOUT`), matching the default request timeout of
+the OpenAI Python SDK used by upstream. A timeout resubmits the identical request, at
+most three total attempts; no retry crops the image or removes chemical fields.
+
 ## Azure OpenAI backend
 
 Azure remains the no-argument default. Both explicit names and the original aliases

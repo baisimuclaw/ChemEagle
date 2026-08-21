@@ -127,7 +127,7 @@ class OpenAICompatibleBackend(BaseLLMBackend):
 
     def generate(self, request: LLMRequest) -> LLMResponse:
         kwargs = self._request_kwargs(request)
-        attempts = max(1, self.config.max_retries)
+        attempts = max(1, min(self.config.max_retries, 3))
         last: Optional[Exception] = None
         for attempt in range(attempts):
             normalised: Optional[LLMResponse] = None

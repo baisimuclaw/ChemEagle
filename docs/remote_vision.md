@@ -142,7 +142,7 @@ export CHEMEAGLE_VISION_SLURM_SUBMIT_HOST=sandbox
 export CHEMEAGLE_VISION_SLURM_GPU_TYPE=L40S
 export CHEMEAGLE_VISION_SLURM_GPUS=1
 export CHEMEAGLE_VISION_SLURM_CPUS=8
-export CHEMEAGLE_VISION_SLURM_MEMORY=64G
+export CHEMEAGLE_VISION_SLURM_MEMORY=24G
 export CHEMEAGLE_VISION_SLURM_TIME=08:00:00
 ```
 
@@ -215,13 +215,35 @@ finally:
 One worker serializes requests, appropriate for one 8 GB 3060 Ti. For L40S batch
 parallelism, start several workers with separate Slurm GPU allocations.
 
-Codex uses a four-minute response window and retries the same request at most
-three times. Time spent inside a running vision tool is excluded from that
-window; the response timer restarts after the tool result reaches Codex. Enable
-stage tracing while validating a deployment:
+For unattended multi-image validation, use the process-isolated batch runner. Each
+child owns its Codex App Server, SSH connection, Slurm allocation, cache, and logs;
+finishing one item immediately frees a concurrency slot for the next:
+
+```bash
+python scripts/run_batch.py \
+  --manifest /LOCAL/PATH/manifest.json \
+  --run-dir /LOCAL/PATH/run \
+  --max-parallel 2
+```
+
+The manifest contains an `items` list with unique `id` and `image` fields. Relative
+image paths are resolved beside the manifest. Successful items are skipped when the
+same run directory is resumed. `status.json` is updated atomically, combined per-item
+logs are written under `logs/`, remote worker stderr uses `*.remote.log`, and final
+structured results use `results/*.json`. Set `CHEMEAGLE_VISION_REMOTE_LOG` when using
+the backend outside this runner to persist remote stderr locally.
+
+Codex uses a four-minute ordinary response window. The final Data Structure Agent
+uses the upstream-compatible ten-minute window because it receives the complete
+original image, prompt, and agent results. Both retry the identical request at most
+three total attempts. Ordinary App Server progress notifications reset the silence
+window; time spent inside a running vision tool is excluded, and the response timer
+restarts after the tool result reaches Codex. Enable stage tracing while validating a
+deployment:
 
 ```bash
 export CHEMEAGLE_LLM_TIMEOUT=240
+export CHEMEAGLE_LLM_SYNTHESIS_TIMEOUT=600
 export CHEMEAGLE_LLM_MAX_RETRIES=3
 export CHEMEAGLE_TRACE=1
 ```
@@ -241,9 +263,9 @@ tool-payload character counts. It does not print credentials or tool results.
 ChemRxnExtractor defaults to CPU, matching the upstream text agent and avoiding
 contention with the PyTorch vision models already resident on the GPU. Set
 `CHEMEAGLE_VISION_CHEMRXN_DEVICE=cuda` only after validating that combination on
-the target environment. Scheme-only OCR is filtered before ChemNER and
-ChemRxnExtractor by default; set `CHEMEAGLE_TEXT_PROSE_FILTER=0` on the workstation
-to restore the upstream all-text behaviour.
+the target environment. All OCR fragments are passed through by default, matching
+upstream. Set `CHEMEAGLE_TEXT_PROSE_FILTER=1` only when explicitly trading recall for
+faster text-model processing.
 
 ## Common failures
 

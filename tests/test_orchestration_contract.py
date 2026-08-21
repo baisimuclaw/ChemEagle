@@ -45,7 +45,7 @@ class _FakeBackend:
 
 
 class ImportAndOrchestrationTests(unittest.TestCase):
-    def test_text_models_receive_only_sentence_like_prose(self):
+    def test_text_filter_is_opt_in_and_upstream_input_is_default(self):
         ocr = (
             "DBU (1.1 equiv) benzene reflux 2 h\n"
             "6a: Ar = Ph; 61%, E/Z = 90:10\n"
@@ -60,8 +60,13 @@ class ImportAndOrchestrationTests(unittest.TestCase):
             [],
         )
         with mock.patch.dict(
-            os.environ, {"CHEMEAGLE_TEXT_PROSE_FILTER": "0"}, clear=False
+            os.environ, {"CHEMEAGLE_TEXT_PROSE_FILTER": "1"}, clear=False
         ):
+            self.assertEqual(
+                get_text_agent._text_model_sentences("DBU reagent."),
+                [],
+            )
+        with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
                 get_text_agent._text_model_sentences("DBU reagent."),
                 ["DBU reagent."],
@@ -341,7 +346,7 @@ class ImportAndOrchestrationTests(unittest.TestCase):
             [[0.1, 0.2]],
         )
 
-    def test_final_and_text_synthesis_receive_compact_agent_results(self):
+    def test_final_synthesis_preserves_upstream_input_and_timeout(self):
         source = (ROOT / "main.py").read_text(encoding="utf-8")
         function_source = next(
             ast.get_source_segment(source, node)
@@ -351,15 +356,28 @@ class ImportAndOrchestrationTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "agent_name: compact_vision_tool_value(agent_result)",
+            "agent_name: agent_result",
             function_source,
         )
+        self.assertIn("'./prompt/prompt_final_simple_version.txt'", function_source)
+        self.assertIn("'url': f'data:image/png;base64,{base64_image}'", function_source)
+        self.assertIn('"synthesis_timeout"', function_source)
         self.assertGreaterEqual(
-            function_source.count(
-                "graphical_input=compact_vision_tool_value(main_area_result)"
-            ),
+            function_source.count("graphical_input=main_area_result"),
             2,
         )
+
+        r_group_source = (ROOT / "get_R_group_sub_agent.py").read_text(
+            encoding="utf-8"
+        )
+        nested_function = next(
+            ast.get_source_segment(r_group_source, node)
+            for node in ast.parse(r_group_source).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_run_image_tool_agent_with_results"
+        )
+        self.assertIn("llm_value = value", nested_function)
+        self.assertNotIn("compact_vision_tool_value", nested_function)
 
     def test_all_molecular_agent_variants_use_request_scoped_raw_cache(self):
         source = (ROOT / "get_molecular_agent.py").read_text(encoding="utf-8")

@@ -31,6 +31,7 @@ class BackendConfig:
     azure_endpoint: Optional[str] = None
     azure_api_version: str = "2024-10-21"
     timeout: float = 180.0
+    synthesis_timeout: float = 600.0
     tool_timeout: float = 3600.0
     max_retries: int = 3
     supports_tools: bool = True
@@ -62,6 +63,9 @@ class BackendConfig:
 
         default_timeout = "240" if selected == "codex" else "180"
         timeout = float(values.get("CHEMEAGLE_LLM_TIMEOUT", default_timeout))
+        synthesis_timeout = float(
+            values.get("CHEMEAGLE_LLM_SYNTHESIS_TIMEOUT", "600")
+        )
         tool_timeout = float(values.get("CHEMEAGLE_LLM_TOOL_TIMEOUT", "3600"))
         retries = int(values.get("CHEMEAGLE_LLM_MAX_RETRIES", "3"))
         common_model = model or values.get("CHEMEAGLE_LLM_MODEL")
@@ -76,6 +80,7 @@ class BackendConfig:
                     values, "AZURE_OPENAI_API_VERSION", "API_VERSION", default="2024-10-21"
                 ) or "2024-10-21",
                 timeout=timeout,
+                synthesis_timeout=synthesis_timeout,
                 tool_timeout=tool_timeout,
                 max_retries=retries,
                 supports_tools=True,
@@ -103,6 +108,7 @@ class BackendConfig:
                     default="http://localhost:8000/v1",
                 ),
                 timeout=timeout,
+                synthesis_timeout=synthesis_timeout,
                 tool_timeout=tool_timeout,
                 max_retries=retries,
                 supports_tools=_env_bool(values, "VLLM_SUPPORTS_TOOLS", True),
@@ -119,6 +125,7 @@ class BackendConfig:
             provider=selected,
             model=common_model or values.get("CODEX_MODEL"),
             timeout=timeout,
+            synthesis_timeout=synthesis_timeout,
             tool_timeout=tool_timeout,
             max_retries=retries,
             supports_tools=True,

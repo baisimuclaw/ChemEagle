@@ -8,6 +8,8 @@ import queue
 import shlex
 import subprocess
 import threading
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .codec import decode_value, encode_value
@@ -231,7 +233,22 @@ class RemoteVisionBackend:
                 if value:
                     self._stderr_lines.append(value)
                     del self._stderr_lines[:-100]
+                    self._append_remote_log(value)
         except Exception:
+            return
+
+    def _append_remote_log(self, value: str) -> None:
+        """Persist remote diagnostics locally without touching JSONL stdout."""
+        if not self.config.remote_log:
+            return
+        path = Path(self.config.remote_log).expanduser()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now(timezone.utc).isoformat()
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{timestamp} {value}\n")
+        except OSError:
+            # Diagnostics must never take down an otherwise healthy worker.
             return
 
     def _fail_pending(self, exc: Exception) -> None:
