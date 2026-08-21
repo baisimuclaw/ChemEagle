@@ -294,12 +294,24 @@ class RemoteVisionBackend:
     def close(self) -> None:
         if self._closed:
             return
+        shutdown_acknowledged = False
         if self._process is not None and self._started and self.process.poll() is None:
             try:
                 self._request("shutdown", {}, timeout=5)
+                shutdown_acknowledged = True
             except Exception:
                 pass
         self._closed = True
+        if shutdown_acknowledged and self._process is not None:
+            # The worker acknowledges before Python releases its loaded CUDA
+            # models. Give the SSH -> submit-host SSH -> srun chain time to
+            # unwind naturally; terminating the outer SSH immediately can
+            # orphan the Slurm allocation until its time limit.
+            try:
+                self.process.wait(timeout=30)
+                return
+            except subprocess.TimeoutExpired:
+                pass
         if self._process is not None and self.process.poll() is None:
             try:
                 self.process.terminate()

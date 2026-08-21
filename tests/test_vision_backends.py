@@ -167,6 +167,53 @@ class VisionProxyTests(unittest.TestCase):
         )
 
 
+class RemoteVisionLifecycleTests(unittest.TestCase):
+    def test_close_waits_for_graceful_slurm_chain_exit_after_shutdown_ack(self):
+        class FakeProcess:
+            def __init__(self):
+                self.returncode = None
+                self.wait_timeouts = []
+                self.terminate_calls = 0
+                self.kill_calls = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                self.returncode = 0
+                return 0
+
+            def terminate(self):
+                self.terminate_calls += 1
+
+            def kill(self):
+                self.kill_calls += 1
+
+        process = FakeProcess()
+        backend = RemoteVisionBackend(
+            VisionConfig(
+                provider="slurm-ssh",
+                ssh_host="cluster-login",
+                remote_dir="/shared/ChemEagle",
+            ),
+            process_factory=mock.Mock(),
+        )
+        backend._process = process
+        backend._started = True
+        with mock.patch.object(
+            backend,
+            "_request",
+            return_value={"status": "closing"},
+        ) as request:
+            backend.close()
+
+        request.assert_called_once_with("shutdown", {}, timeout=5)
+        self.assertEqual(process.wait_timeouts, [30])
+        self.assertEqual(process.terminate_calls, 0)
+        self.assertEqual(process.kill_calls, 0)
+
+
 class WorkerProtocolTests(unittest.TestCase):
     def test_stdio_dispatch_and_unknown_method_failure(self):
         class FakeRuntime:
