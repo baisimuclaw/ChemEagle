@@ -19,6 +19,39 @@ MOLECULAR_TOOL_OMITTED_FIELDS = (
     "corefs",
 )
 
+VISION_TOOL_GRAPH_FIELDS = frozenset(
+    {
+        "coords",
+        "edges",
+        "molfile",
+        "atoms",
+        "bonds",
+        "category_id",
+        "score",
+    }
+)
+
+
+def compact_vision_tool_value(value: Any) -> Any:
+    """Copy a vision result while removing graph details not useful to an LLM.
+
+    Full graph data remains in the caller's request-local cache for deterministic
+    SMILES reconstruction. The returned projection retains chemistry-bearing
+    fields such as ``smiles``, ``symbols``, text, bounding boxes, and coreference
+    relationships while avoiding large coordinate/adjacency payloads.
+    """
+    if isinstance(value, dict):
+        return {
+            key: compact_vision_tool_value(item)
+            for key, item in value.items()
+            if key not in VISION_TOOL_GRAPH_FIELDS
+        }
+    if isinstance(value, list):
+        return [compact_vision_tool_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [compact_vision_tool_value(item) for item in value]
+    return copy.deepcopy(value)
+
 
 def compact_molecular_tool_result(
     raw_prediction: list,

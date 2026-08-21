@@ -15,6 +15,7 @@ import queue
 import random
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -55,6 +56,16 @@ _REDACT_RE = re.compile(
 def _redact(text: str) -> str:
     text = _REDACT_RE.sub(r"\1=<redacted>", text)
     return re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?<redacted>", text)
+
+
+def _trace(message: str) -> None:
+    if os.environ.get("CHEMEAGLE_TRACE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        print(f"[ChemEAGLE Codex] {message}", file=sys.stderr, flush=True)
 
 
 def _version_tuple(value: str) -> Tuple[int, int, int]:
@@ -397,11 +408,21 @@ class CodexAppServerClient:
                     tool_result("Tool arguments must be a JSON object", success=False),
                 )
                 return
+            started_at = time.monotonic()
+            _trace(f"tool/start name={tool_name}")
             try:
                 result = handler(**arguments)
                 text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                _trace(
+                    f"tool/complete name={tool_name} elapsed={time.monotonic() - started_at:.3f}s "
+                    f"payload_chars={len(text)}"
+                )
                 self._send_result(request_id, tool_result(text, success=True))
             except Exception as exc:
+                _trace(
+                    f"tool/error name={tool_name} elapsed={time.monotonic() - started_at:.3f}s "
+                    f"type={type(exc).__name__}"
+                )
                 self._send_result(
                     request_id,
                     tool_result(
@@ -721,15 +742,31 @@ class CodexAppServerBackend(BaseLLMBackend):
                 turn_id = str((started_turn.get("turn") or {}).get("id") or "")
                 if not turn_id:
                     raise BackendProcessError("Codex turn/start returned no turn id")
-                completed = self._wait_for_turn(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    after=cursor,
-                    timeout=request.timeout or self.config.timeout,
-                    cancel_event=request.cancel_event,
+                turn_started_at = time.monotonic()
+                _trace(
+                    f"turn/start id={turn_id} attempt={attempt + 1}/{attempts} "
+                    f"tools={len(tools or [])} timeout={request.timeout or self.config.timeout:g}s"
                 )
+                try:
+                    completed = self._wait_for_turn(
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        after=cursor,
+                        timeout=request.timeout or self.config.timeout,
+                        cancel_event=request.cancel_event,
+                    )
+                except Exception as exc:
+                    _trace(
+                        f"turn/error id={turn_id} type={type(exc).__name__} "
+                        f"elapsed={time.monotonic() - turn_started_at:.3f}s"
+                    )
+                    raise
                 turn = (completed.get("params") or {}).get("turn") or {}
                 status = turn.get("status")
+                _trace(
+                    f"turn/complete id={turn_id} status={status} "
+                    f"elapsed={time.monotonic() - turn_started_at:.3f}s"
+                )
                 if status == "cancelled":
                     raise BackendCancelledError("Codex turn was cancelled")
                 if status != "completed":

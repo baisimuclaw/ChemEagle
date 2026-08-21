@@ -14,6 +14,7 @@ import get_reaction_agent
 import get_text_agent
 from chemeagle_vision.request_cache import (
     caching_molecular_tool,
+    compact_vision_tool_value,
     molecular_results_for_request,
 )
 
@@ -131,6 +132,51 @@ class ImportAndOrchestrationTests(unittest.TestCase):
         fallback_predict.assert_called_once_with("input.png")
         self.assertIs(fallback_raw, raw)
         self.assertIs(repeated_raw, raw)
+
+    def test_generic_vision_projection_keeps_chemistry_and_retained_raw_graph(self):
+        raw = {
+            "reaction_prediction": [
+                {
+                    "reactants": [
+                        {
+                            "smiles": "[1*]C#C[2*]",
+                            "symbols": ["[R1]", "C", "C", "[R2]"],
+                            "bbox": [0.1, 0.2, 0.3, 0.4],
+                            "coords": [[0.1, 0.2]],
+                            "edges": [[0]],
+                            "molfile": "large molfile",
+                            "atoms": [{"atom_symbol": "C"}],
+                            "bonds": [],
+                            "category_id": 1,
+                            "score": 2011,
+                        }
+                    ],
+                    "corefs": [[0, 1]],
+                }
+            ]
+        }
+
+        compact = compact_vision_tool_value(raw)
+
+        molecule = compact["reaction_prediction"][0]["reactants"][0]
+        self.assertEqual(molecule["smiles"], "[1*]C#C[2*]")
+        self.assertEqual(molecule["symbols"], ["[R1]", "C", "C", "[R2]"])
+        self.assertEqual(molecule["bbox"], [0.1, 0.2, 0.3, 0.4])
+        self.assertEqual(compact["reaction_prediction"][0]["corefs"], [[0, 1]])
+        for field in (
+            "coords",
+            "edges",
+            "molfile",
+            "atoms",
+            "bonds",
+            "category_id",
+            "score",
+        ):
+            self.assertNotIn(field, molecule)
+        self.assertEqual(
+            raw["reaction_prediction"][0]["reactants"][0]["coords"],
+            [[0.1, 0.2]],
+        )
 
     def test_all_molecular_agent_variants_use_request_scoped_raw_cache(self):
         source = (ROOT / "get_molecular_agent.py").read_text(encoding="utf-8")

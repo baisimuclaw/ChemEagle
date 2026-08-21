@@ -32,6 +32,7 @@ from chemeagle_vision.proxies import (
     vision_rxnim as model1,
     vision_toolkit as model,
 )
+from chemeagle_vision.request_cache import compact_vision_tool_value
 
 
 
@@ -232,19 +233,20 @@ def _run_image_tool_agent_with_results(
                     return handler(image_path)
 
             value = caller_context.copy().run(run_handler)
+            llm_value = compact_vision_tool_value(value)
             message = {
                 "role": "tool",
                 "name": name,
                 "tool_call_id": f"executed-{name}",
                 "content": json.dumps(
-                    {"image_path": image_path, name: value},
+                    {"image_path": image_path, name: llm_value},
                     ensure_ascii=False,
                 ),
             }
             with result_lock:
                 cache[name] = value
                 result_messages.append(message)
-            return value
+            return llm_value
 
         return invoke
 

@@ -215,6 +215,17 @@ finally:
 One worker serializes requests, appropriate for one 8 GB 3060 Ti. For L40S batch
 parallelism, start several workers with separate Slurm GPU allocations.
 
+For long Codex extraction turns (large R-group tables or dense schemes), raise
+the normal turn timeout and enable stage tracing while validating a deployment:
+
+```bash
+export CHEMEAGLE_LLM_TIMEOUT=900
+export CHEMEAGLE_TRACE=1
+```
+
+`CHEMEAGLE_TRACE` reports only turn/tool identifiers, elapsed time, status, and
+tool-payload character counts. It does not print credentials or tool results.
+
 ChemRxnExtractor defaults to CPU, matching the upstream text agent and avoiding
 contention with the PyTorch vision models already resident on the GPU. Set
 `CHEMEAGLE_VISION_CHEMRXN_DEVICE=cuda` only after validating that combination on
