@@ -1,30 +1,59 @@
 import sys
-import torch
 import json
-from chemietoolkit import ChemIEToolkit
 import cv2
 from PIL import Image
 import json
 import sys
-import torch
-from rxnim import RxnIM
 import json
 import sys
-import torch
 import json 
 from molnextr.chemistry import _convert_graph_to_smiles
 import base64
-import torch
 import json
 from PIL import Image
 import numpy as np
-from chemietoolkit import ChemIEToolkit, utils
-from openai import AzureOpenAI, OpenAI, InternalServerError, RateLimitError, APIError
+from chemietoolkit import utils
 import os
 import copy
 from typing import Optional
-import time
 from chemietoolkit.helper import _patch_to_mol
+from chemeagle_llm import (
+    LLMRequest,
+    backend_model,
+    bind_image_tools,
+    get_active_backend,
+    parse_json_content,
+)
+from chemeagle_vision.proxies import vision_toolkit as model
+from chemeagle_vision.request_cache import (
+    MOLECULAR_TOOL_OMITTED_FIELDS as _MOLECULAR_TOOL_OMITTED_FIELDS,
+    caching_molecular_tool,
+    compact_molecular_tool_result as _compact_molecular_tool_result,
+    molecular_results_for_request,
+)
+
+
+MOLECULAR_EMPTY_MAX_ATTEMPTS = 3
+
+
+def _has_molecular_detections(raw_prediction) -> bool:
+    return bool(raw_prediction) and any(
+        isinstance(item, dict) and bool(item.get("bboxes"))
+        for item in raw_prediction
+    )
+
+
+def _empty_molecular_result(raw_prediction) -> list:
+    """Normalize an exhausted empty result to the schema expected downstream."""
+    if (
+        isinstance(raw_prediction, list)
+        and raw_prediction
+        and isinstance(raw_prediction[0], dict)
+    ):
+        raw_prediction[0].setdefault("bboxes", [])
+        raw_prediction[0].setdefault("corefs", [])
+        return raw_prediction
+    return [{"bboxes": [], "corefs": []}]
 
 
 
@@ -62,98 +91,130 @@ def _ga_best_iou_match_idx(target_bbox, orig_bboxes, iou_thresh=0.5):
 
 
 
-def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, **kwargs):
-    last_exception = None
-    
-    for attempt in range(max_retries):
-        try:
-            return func(*args, **kwargs)
-        except (InternalServerError, RateLimitError, APIError) as e:
-            last_exception = e
-            error_code = getattr(e, 'status_code', None) or getattr(e, 'code', None)
-            error_message = str(e)
-            
-            # Check whether this is a 503 error or another retryable error
-            if error_code == 503 or 'overloaded' in error_message.lower() or '503' in error_message:
-                if attempt < max_retries - 1:
-                    delay = base_delay * (backoff_factor ** attempt)
-                    print(f"⚠️ API call failed (503/overloaded), attempt {attempt + 1}/{max_retries}. Retrying in {delay:.1f} seconds...")
-                    time.sleep(delay)
-                    continue
-                else:
-                    print(f"❌ API call failed, reached maximum retries ({max_retries})")
-                    raise
-            else:
-                # Other error types, raise directly
-                raise
-        except Exception as e:
-            # Other unknown errors, raise directly
-            raise
-    
-    # If all retries failed
-    if last_exception:
-        raise last_exception
-    raise RuntimeError("API call failed, unknown error")
+def _run_image_tool_agent(
+    backend,
+    image_path,
+    messages,
+    tools,
+    model_name,
+    handlers,
+    *,
+    require_tool_call=True,
+    followup_on_no_tool_call=False,
+    temperature=None,
+):
+    def wrap_tool_result(name, handler):
+        def invoke(trusted_image_path):
+            return {
+                "image_path": trusted_image_path,
+                name: handler(trusted_image_path),
+            }
+
+        return invoke
+
+    response = backend.run_tool_loop(
+        LLMRequest(
+            model=backend_model(backend, model_name),
+            messages=messages,
+            json_mode=True,
+            temperature=temperature,
+            tool_choice="auto",
+            require_tool_call=require_tool_call,
+            followup_on_no_tool_call=followup_on_no_tool_call,
+            validate_tool_arguments=False,
+            defer_json_validation_for_tools=True,
+        ),
+        tools,
+        bind_image_tools(
+            image_path,
+            {
+                name: wrap_tool_result(name, handler)
+                for name, handler in handlers.items()
+            },
+        ),
+    )
+    return [parse_json_content(response)]
 
 
-ckpt_path = "./rxn.ckpt"
-model1 = RxnIM(ckpt_path, device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-model = ChemIEToolkit(device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def _predict_molecular(
+    image_path: str,
+    *,
+    max_attempts: int = MOLECULAR_EMPTY_MAX_ATTEMPTS,
+) -> list:
+    """Retry empty molecule/coreference inference and retain the full result."""
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
 
-API_KEY = os.getenv("API_KEY")
-if not API_KEY:
-    raise ValueError("Please set API_KEY")
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
-API_VERSION = os.getenv("API_VERSION")
+    image = Image.open(image_path).convert("RGB")
+    raw_prediction = None
+    for attempt in range(1, max_attempts + 1):
+        raw_prediction = model.extract_molecule_corefs_from_figures([image])
+        if _has_molecular_detections(raw_prediction):
+            return raw_prediction
+        if attempt < max_attempts:
+            print(
+                "Warning: molecule/coreference vision returned no detections "
+                f"(attempt {attempt}/{max_attempts}); retrying."
+            )
+
+    print(
+        "Warning: molecule/coreference vision returned no detections after "
+        f"{max_attempts} attempts; continuing with an empty structured result."
+    )
+    return _empty_molecular_result(raw_prediction)
+
+
+def _caching_molecular_tool(cache):
+    """Return a request-scoped tool that reuses one full vision prediction."""
+    return caching_molecular_tool(cache, _predict_molecular)
+
+
+def _molecular_results_for_request(cache, image_path: str) -> list:
+    """Return the request's retained raw graph, running vision only if no tool ran."""
+    return molecular_results_for_request(cache, _predict_molecular, image_path)
 
 def get_multi_molecular(image_path: str) -> list:
     '''Returns a list of reactions extracted from the image.'''
-    # Open image file
-    image = Image.open(image_path).convert('RGB')
-    
-    # Pass image as input to the model
-    coref_results = model.extract_molecule_corefs_from_figures([image])
-    #print(f"coref_results:{coref_results}")
-    for item in coref_results:
-        for bbox in item.get("bboxes", []):
-            for key in ["category", "molfile", "symbols", 'atoms', "bonds", 'category_id', 'score', 'corefs']: #'atoms'
-                bbox.pop(key, None)  # Safely remove key
-    #print(json.dumps(coref_results))
-    # Return reaction list, formatted with json.dumps
-    
-    return json.dumps(coref_results)
+    raw_prediction = _predict_molecular(image_path)
+    return _compact_molecular_tool_result(
+        raw_prediction,
+        (
+            "category",
+            "molfile",
+            "symbols",
+            "atoms",
+            "bonds",
+            "category_id",
+            "score",
+            "corefs",
+        ),
+    )
 
 def get_multi_molecular_text_to_correct(image_path: str) -> list:
     '''Returns a list of reactions extracted from the image.'''
-    # Open image file
-    image = Image.open(image_path).convert('RGB')
-    
-    # Pass image as input to the model
-    coref_results = model.extract_molecule_corefs_from_figures([image])
-    for item in coref_results:
-        for bbox in item.get("bboxes", []):
-            for key in ["category", "bbox", "molfile", "symbols", 'atoms', "bonds", 'category_id', 'score', 'corefs']: #'atoms'
-                bbox.pop(key, None)  # Safely remove key
-    #print(json.dumps(coref_results))
-    # Return reaction list, formatted with json.dumps
-    
-    return json.dumps(coref_results)
+    raw_prediction = _predict_molecular(image_path)
+    return _compact_molecular_tool_result(
+        raw_prediction,
+        (
+            "category",
+            "bbox",
+            "molfile",
+            "symbols",
+            "atoms",
+            "bonds",
+            "category_id",
+            "score",
+            "corefs",
+        ),
+    )
 
 def get_multi_molecular_text_to_correct_withatoms(image_path: str) -> list:
     '''Returns a list of reactions extracted from the image.'''
-    # Open image file
-    image = Image.open(image_path).convert('RGB')
-    
-    # Pass image as input to the model
-    coref_results = model.extract_molecule_corefs_from_figures([image])
-    for item in coref_results:
-        for bbox in item.get("bboxes", []):
-            for key in ["coords","edges","molfile", 'atoms', "bonds", 'category_id', 'score', 'corefs']: #'atoms'
-                bbox.pop(key, None)  # Safely remove key
-    #print(json.dumps(coref_results))
-    # Return reaction list, formatted with json.dumps
-    return json.dumps(coref_results)
+    raw_prediction = _predict_molecular(image_path)
+    return _compact_molecular_tool_result(
+        raw_prediction,
+        _MOLECULAR_TOOL_OMITTED_FIELDS,
+    )
 
 
 
@@ -171,11 +232,7 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
         dict: organized reaction data, including reactants, products, and reaction templates.
     """
 
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
-    )
+    backend = get_active_backend()
 
     # Load image and encode as Base64
     def encode_image(image_path: str):
@@ -221,115 +278,24 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
         }
     ]
 
-    # Call GPT API
-    response = client.chat.completions.create(
-    model = 'gpt-4o',
-    temperature = 0,
-    response_format={ 'type': 'json_object' },
-    messages = [
-        {'role': 'system', 'content': 'You are a helpful assistant.'},
+    raw_prediction_cache = {}
+    gpt_output = _run_image_tool_agent(
+        backend,
+        image_path,
+        messages,
+        tools,
+        "gpt-4o",
         {
-            'role': 'user',
-            'content': [
-                {
-                    'type': 'text',
-                    'text': prompt
-                },
-                {
-                    'type': 'image_url',
-                    'image_url': {
-                        'url': f'data:image/png;base64,{base64_image}'
-                    }
-                }
-            ]},
-    ],
-    tools = tools)
-    
-# Step 1: Tool mapping table
-    TOOL_MAP = {
-        'get_multi_molecular_text_to_correct_withatoms': get_multi_molecular_text_to_correct_withatoms,
-    }
-
-    # Step 2: Handle multiple tool calls
-    tool_calls = response.choices[0].message.tool_calls
-    results = []
-
-    # Iterate through each tool call
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        tool_arguments = tool_call.function.arguments
-        tool_call_id = tool_call.id
-        
-        tool_args = json.loads(tool_arguments)
-        
-        if tool_name in TOOL_MAP:
-            # Call tool and get result
-            tool_result = TOOL_MAP[tool_name](image_path)
-        else:
-            raise ValueError(f"Unknown tool called: {tool_name}")
-        
-        # Save each tool-call result
-        results.append({
-            'role': 'tool',
-            'name': tool_name,  # Gemini API requires the name field
-            'content': json.dumps({
-                'image_path': image_path,
-                f'{tool_name}':(tool_result),
-            }),
-            'tool_call_id': tool_call_id,
-        })
-
-
-# Prepare the chat completion payload
-    completion_payload = {
-        'model': 'gpt-4o',
-        'messages': [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': prompt
-                    },
-                    {
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': f'data:image/png;base64,{base64_image}'
-                        }
-                    }
-                ]
-            },
-            response.choices[0].message,
-            *results
-            ],
-    }
-
-# Generate new response
-    response = client.chat.completions.create(
-        model=completion_payload["model"],
-        messages=completion_payload["messages"],
-        response_format={ 'type': 'json_object' },
-        temperature=0
+            "get_multi_molecular_text_to_correct_withatoms":
+                _caching_molecular_tool(raw_prediction_cache),
+        },
+        temperature=0,
     )
 
-
-    
-    # Get GPT-generated result
-    gpt_output = [json.loads(response.choices[0].message.content)]
-
-
-    def get_multi_molecular(image_path: str) -> list:
-        '''Returns a list of reactions extracted from the image.'''
-        # Open image file
-        image = Image.open(image_path).convert('RGB')
-        
-        # Pass image as input to the model
-        coref_results = model.extract_molecule_corefs_from_figures([image])
-        return coref_results
-
-    
-    coref_results = get_multi_molecular(image_path)
+    coref_results = _molecular_results_for_request(
+        raw_prediction_cache,
+        image_path,
+    )
 
 
     def update_symbols_in_atoms(input1, input2):
@@ -405,7 +371,6 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
     updated_data = update_smiles_and_molfile(input2_updated, _convert_graph_to_smiles)
 
     return updated_data
-
     
     
 
@@ -424,11 +389,7 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
     Returns:
         dict: organized reaction data, including reactants, products, and reaction templates.
     """
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
-    )
+    backend = get_active_backend()
 
     # Load image and encode as Base64
     def encode_image(image_path: str):
@@ -474,116 +435,25 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
         }
     ]
 
-    # Call GPT API
-    response = client.chat.completions.create(
-    model = 'gpt-4o',
-    temperature = 0,
-    response_format={ 'type': 'json_object' },
-    messages = [
-        {'role': 'system', 'content': 'You are a helpful assistant.'},
+    raw_prediction_cache = {}
+    gpt_output = _run_image_tool_agent(
+        backend,
+        image_path,
+        messages,
+        tools,
+        "gpt-4o",
         {
-            'role': 'user',
-            'content': [
-                {
-                    'type': 'text',
-                    'text': prompt
-                },
-                {
-                    'type': 'image_url',
-                    'image_url': {
-                        'url': f'data:image/png;base64,{base64_image}'
-                    }
-                }
-            ]},
-    ],
-    tools = tools)
-    
-# Step 1: Tool mapping table
-    TOOL_MAP = {
-        'get_multi_molecular_text_to_correct_withatoms': get_multi_molecular_text_to_correct_withatoms,
-    }
-
-    # Step 2: Handle multiple tool calls
-    tool_calls = response.choices[0].message.tool_calls
-    results = []
-
-    # Iterate through each tool call
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        tool_arguments = tool_call.function.arguments
-        tool_call_id = tool_call.id
-        
-        tool_args = json.loads(tool_arguments)
-        
-        if tool_name in TOOL_MAP:
-            # Call tool and get result
-            tool_result = TOOL_MAP[tool_name](image_path)
-        else:
-            raise ValueError(f"Unknown tool called: {tool_name}")
-        
-        # Save each tool-call result
-        results.append({
-            'role': 'tool',
-            'name': tool_name,  # Gemini API requires the name field
-            'content': json.dumps({
-                'image_path': image_path,
-                f'{tool_name}':(tool_result),
-            }),
-            'tool_call_id': tool_call_id,
-        })
-
-
-# Prepare the chat completion payload
-    completion_payload = {
-        'model': 'gpt-4o',
-        'messages': [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': prompt
-                    },
-                    {
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': f'data:image/png;base64,{base64_image}'
-                        }
-                    }
-                ]
-            },
-            response.choices[0].message,
-            *results
-            ],
-    }
-
-# Generate new response
-    response = client.chat.completions.create(
-        model=completion_payload["model"],
-        messages=completion_payload["messages"],
-        response_format={ 'type': 'json_object' },
-        temperature=0
+            "get_multi_molecular_text_to_correct_withatoms":
+                _caching_molecular_tool(raw_prediction_cache),
+        },
+        temperature=0,
     )
-
-
-    
-    # Get GPT-generated result
-    gpt_output = [json.loads(response.choices[0].message.content)]
     print(f"gpt_output_mol:{gpt_output}")
 
-
-    def get_multi_molecular(image_path: str) -> list:
-        '''Returns a list of reactions extracted from the image.'''
-        # Open image file
-        image = Image.open(image_path).convert('RGB')
-        
-        # Pass image as input to the model
-        coref_results = model.extract_molecule_corefs_from_figures([image])
-        return coref_results
-
-    
-    coref_results = get_multi_molecular(image_path)
+    coref_results = _molecular_results_for_request(
+        raw_prediction_cache,
+        image_path,
+    )
 
 
     def update_symbols_in_atoms(input1, input2):
@@ -673,11 +543,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
     Returns:
         dict: organized reaction data, including reactants, products, and reaction templates.
     """
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
-    )
+    backend = get_active_backend()
 
     # Load image and encode as Base64
     def encode_image(image_path: str):
@@ -723,116 +589,24 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
         }
     ]
 
-    # Call GPT API
-    response = client.chat.completions.create(
-    model = 'gpt-5-mini',
-    #temperature = 0,
-    response_format={ 'type': 'json_object' },
-    messages = [
-        {'role': 'system', 'content': 'You are a helpful assistant.'},
+    raw_prediction_cache = {}
+    gpt_output = _run_image_tool_agent(
+        backend,
+        image_path,
+        messages,
+        tools,
+        "gpt-5-mini",
         {
-            'role': 'user',
-            'content': [
-                {
-                    'type': 'text',
-                    'text': prompt
-                },
-                {
-                    'type': 'image_url',
-                    'image_url': {
-                        'url': f'data:image/png;base64,{base64_image}'
-                    }
-                }
-            ]},
-    ],
-    tools = tools)
-    
-# Step 1: Tool mapping table
-    TOOL_MAP = {
-        'get_multi_molecular_text_to_correct_withatoms': get_multi_molecular_text_to_correct_withatoms,
-    }
-
-    # Step 2: Handle multiple tool calls
-    tool_calls = response.choices[0].message.tool_calls
-    results = []
-
-    # Iterate through each tool call
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        tool_arguments = tool_call.function.arguments
-        tool_call_id = tool_call.id
-        
-        tool_args = json.loads(tool_arguments)
-        
-        if tool_name in TOOL_MAP:
-            # Call tool and get result
-            tool_result = TOOL_MAP[tool_name](image_path)
-        else:
-            raise ValueError(f"Unknown tool called: {tool_name}")
-        
-        # Save each tool-call result
-        results.append({
-            'role': 'tool',
-            'name': tool_name,  # Gemini API requires the name field
-            'content': json.dumps({
-                'image_path': image_path,
-                f'{tool_name}':(tool_result),
-            }),
-            'tool_call_id': tool_call_id,
-        })
-
-
-# Prepare the chat completion payload
-    completion_payload = {
-        'model': 'gpt-5-mini',
-        'messages': [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': prompt
-                    },
-                    {
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': f'data:image/png;base64,{base64_image}'
-                        }
-                    }
-                ]
-            },
-            response.choices[0].message,
-            *results
-            ],
-    }
-
-# Generate new response
-    response = client.chat.completions.create(
-        model=completion_payload["model"],
-        messages=completion_payload["messages"],
-        response_format={ 'type': 'json_object' },
-        #temperature=0
+            "get_multi_molecular_text_to_correct_withatoms":
+                _caching_molecular_tool(raw_prediction_cache),
+        },
     )
-
-
-    
-    # Get GPT-generated result
-    gpt_output = [json.loads(response.choices[0].message.content)]
     print(f"gpt_output_mol:{gpt_output}")
 
-
-    def get_multi_molecular(image_path: str) -> list:
-        '''Returns a list of reactions extracted from the image.'''
-        # Open image file
-        image = Image.open(image_path).convert('RGB')
-        
-        # Pass image as input to the model
-        coref_results = model.extract_molecule_corefs_from_figures([image])
-        return coref_results
-
-    
-    coref_results = get_multi_molecular(image_path)
+    coref_results = _molecular_results_for_request(
+        raw_prediction_cache,
+        image_path,
+    )
 
 
     def update_symbols_and_corefs(gpt_outputs, coref_results):
@@ -949,10 +723,9 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
     Returns:
         dict: organized reaction data, including reactants, products, and reaction templates.
     """
-    base_url = base_url or os.getenv("VLLM_BASE_URL", os.getenv("OLLAMA_BASE_URL", "http://localhost:8000/v1"))
-    api_key = api_key or os.getenv("VLLM_API_KEY", os.getenv("OLLAMA_API_KEY", "EMPTY"))
-
-    client = OpenAI(
+    backend = get_active_backend(
+        provider="local",
+        model=model_name,
         base_url=base_url,
         api_key=api_key,
     )
@@ -1000,117 +773,28 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
         }
     ]
 
-    # Call GPT API (with retry mechanism)
-    response = retry_api_call(
-        client.chat.completions.create,
-        max_retries=5,
-        base_delay=3,
-        backoff_factor=2,
-        model=model_name,
+    raw_prediction_cache = {}
+    gpt_output = _run_image_tool_agent(
+        backend,
+        image_path,
+        messages,
+        tools,
+        model_name,
+        {
+            "get_multi_molecular_text_to_correct_withatoms":
+                _caching_molecular_tool(raw_prediction_cache),
+        },
+        require_tool_call=False,
+        followup_on_no_tool_call=True,
         temperature=0,
-        #response_format={'type': 'json_object'},  # vLLM does not support using response_format and tools simultaneously
-        messages=messages,
-        tools=tools,
-        tool_choice="auto",
     )
-    
-    # Step 1: Tool mapping table
-    TOOL_MAP = {
-        'get_multi_molecular_text_to_correct_withatoms': get_multi_molecular_text_to_correct_withatoms,
-    }
-
-    # Step 2: Handle multiple tool calls
-    tool_calls = response.choices[0].message.tool_calls or []
-    results = []
-
-    # Iterate through each tool call
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        tool_arguments = tool_call.function.arguments
-        tool_call_id = tool_call.id
-        
-        tool_args = json.loads(tool_arguments)
-        
-        if tool_name in TOOL_MAP:
-            # Call tool and get result
-            tool_result = TOOL_MAP[tool_name](image_path)
-        else:
-            raise ValueError(f"Unknown tool called: {tool_name}")
-        
-        # Save each tool-call result
-        results.append({
-            'role': 'tool',
-            'name': tool_name,  # Gemini API requires the name field
-            'content': json.dumps({
-                'image_path': image_path,
-                f'{tool_name}':(tool_result),
-            }),
-            'tool_call_id': tool_call_id,
-        })
-
-    # Prepare the chat completion payload
-    completion_payload = {
-        'model': model_name,
-        'messages': [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': prompt
-                    },
-                    {
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': f'data:image/png;base64,{base64_image}'
-                        }
-                    }
-                ]
-            },
-            response.choices[0].message,
-            *results
-            ],
-    }
-
-    # Generate new response (with retry mechanism)
-    response = retry_api_call(
-        client.chat.completions.create,
-        max_retries=5,
-        base_delay=3,
-        backoff_factor=2,
-        model=completion_payload["model"],
-        messages=completion_payload["messages"],
-        response_format={'type': 'json_object'},
-        temperature=0
-    )
-
-    # Get GPT-generated result
-    raw_content = response.choices[0].message.content
-
-    try:
-        gpt_output = [json.loads(raw_content)]
-        print(f"DEBUG [OS]: Successfully parsed JSON directly")
-    except json.JSONDecodeError:
-        print(f"ERROR [OS]: Failed to parse JSON from model response")
-        print(f"Raw content (last 2000 chars):\n{raw_content[-2000:]}")
-        raise json.JSONDecodeError(
-            f"Could not parse JSON from model response. Content may not be valid JSON.",
-            raw_content, 0
-        )
     
     print(f"gpt_output_mol:{gpt_output}")
 
-    def get_multi_molecular(image_path: str) -> list:
-        '''Returns a list of reactions extracted from the image.'''
-        # Open image file
-        image = Image.open(image_path).convert('RGB')
-        
-        # Pass image as input to the model
-        coref_results = model.extract_molecule_corefs_from_figures([image])
-        return coref_results
-
-    coref_results = get_multi_molecular(image_path)
+    coref_results = _molecular_results_for_request(
+        raw_prediction_cache,
+        image_path,
+    )
 
     def update_symbols_and_corefs(gpt_outputs, coref_results):
         results = []

@@ -1,3 +1,4 @@
+import os
 import torch
 import re
 from functools import lru_cache
@@ -13,11 +14,24 @@ from .tableextractor import TableExtractor
 from .utils import *
 
 class ChemIEToolkit:
-    def __init__(self, device=None):
+    def __init__(
+        self,
+        device=None,
+        *,
+        model_dir=None,
+        offline=False,
+        chemrxn_device="auto",
+    ):
         if device is None:
             self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
         else:
             self.device = torch.device(device)
+
+        self.model_dir = (
+            os.path.abspath(os.path.expanduser(model_dir)) if model_dir else None
+        )
+        self.offline = bool(offline)
+        self.chemrxn_device = chemrxn_device
 
         self._molnextr = None
         self._rxnim = None
@@ -26,6 +40,18 @@ class ChemIEToolkit:
         self._chemrxnextractor = None
         self._chemner = None
         self._coref = None
+
+    def _model_file(self, filename, downloader):
+        """Use an explicit remote asset when configured; otherwise use upstream HF."""
+        if self.model_dir:
+            path = os.path.join(self.model_dir, filename)
+            if os.path.exists(path):
+                return path
+            if self.offline:
+                raise FileNotFoundError(
+                    f"Required offline ChemEAGLE model is missing: {path}"
+                )
+        return downloader()
 
     @property
     def molnextr(self):
@@ -41,7 +67,10 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "molnextr.pth")
+            ckpt_path = self._model_file(
+                "molnextr.pth",
+                lambda: hf_hub_download("CYF200127/ChemEAGLEModel", "molnextr.pth"),
+            )
         self._molnextr = MolNexTR(ckpt_path, device=self.device)
     
 
@@ -59,7 +88,10 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "rxn.ckpt")
+            ckpt_path = self._model_file(
+                "rxn.ckpt",
+                lambda: hf_hub_download("CYF200127/ChemEAGLEModel", "rxn.ckpt"),
+            )
         self._rxnim = RxnIM(ckpt_path, device=self.device)
     
 
@@ -94,7 +126,10 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "moldet.ckpt")
+            ckpt_path = self._model_file(
+                "moldet.ckpt",
+                lambda: hf_hub_download("CYF200127/ChemEAGLEModel", "moldet.ckpt"),
+            )
         self._moldet = MolDetect(ckpt_path, device=self.device)
         
 
@@ -112,7 +147,10 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "corefdet.ckpt")
+            ckpt_path = self._model_file(
+                "corefdet.ckpt",
+                lambda: hf_hub_download("CYF200127/ChemEAGLEModel", "corefdet.ckpt"),
+            )
         self._coref = MolDetect(ckpt_path, device=self.device, coref=True)
 
 
@@ -130,8 +168,25 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = snapshot_download(repo_id="amberwang/chemrxnextractor-training-modules")
-        self._chemrxnextractor = ChemRxnExtractor("", None, ckpt_path, self.device.type)
+            local_snapshot = (
+                os.path.join(self.model_dir, "chemrxnextractor")
+                if self.model_dir
+                else None
+            )
+            if local_snapshot and os.path.isdir(local_snapshot):
+                ckpt_path = local_snapshot
+            elif self.offline and local_snapshot:
+                raise FileNotFoundError(
+                    f"Required offline ChemRxnExtractor model is missing: {local_snapshot}"
+                )
+            else:
+                ckpt_path = snapshot_download(
+                    repo_id="amberwang/chemrxnextractor-training-modules"
+                )
+        chemrxn_device = (
+            self.device.type if self.chemrxn_device == "auto" else self.chemrxn_device
+        )
+        self._chemrxnextractor = ChemRxnExtractor("", None, ckpt_path, chemrxn_device)
 
 
     @property
@@ -148,8 +203,20 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "ner.ckpt")
-        self._chemner = ChemNER(ckpt_path, device=self.device)
+            ckpt_path = self._model_file(
+                "ner.ckpt",
+                lambda: hf_hub_download("CYF200127/ChemEAGLEModel", "ner.ckpt"),
+            )
+        base_model = (
+            os.path.join(self.model_dir, "biobert-large-cased")
+            if self.model_dir
+            else None
+        )
+        self._chemner = ChemNER(
+            ckpt_path,
+            device=self.device,
+            roberta_checkpoint=base_model,
+        )
 
     
     @property

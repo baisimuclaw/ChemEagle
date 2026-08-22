@@ -1,37 +1,14 @@
 import base64
 import json
+import logging
 import os
-import time
 from typing import Any, List, Optional
 
-from openai import AzureOpenAI, OpenAI
-from openai import InternalServerError, RateLimitError, APIError
+from chemeagle_llm import LLMRequest, backend_model, get_active_backend
+from chemeagle_llm.base import parse_json_content
 
 
-
-API_KEY = os.getenv("API_KEY")
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
-API_VERSION = os.getenv("API_VERSION")
-
-_client = None
-
-
-def _get_client():
-    global _client
-    if _client is None:
-        api_key = API_KEY or os.getenv("AZURE_OPENAI_API_KEY")
-        azure_endpoint = AZURE_ENDPOINT or os.getenv("AZURE_OPENAI_ENDPOINT")
-        api_version = API_VERSION or "2024-06-01"
-        
-        if not api_key or not azure_endpoint:
-            return None
-        
-        _client = AzureOpenAI(
-            api_key=api_key,
-            api_version=api_version,
-            azure_endpoint=azure_endpoint,
-        )
-    return _client
+logger = logging.getLogger(__name__)
 
 PLAN_PROMPT_TEMPLATE = """System Message: 
 You are a plan observer. Given the graphic and the current list of agent calls (plan), decide whether the plan is sufficient.
@@ -121,26 +98,23 @@ def plan_observer_agent(image_path: str, tool_calls: List[Any]) -> dict:
         )
 
     try:
-        client = _get_client()
-        if client is None:
-            return default
-        
-        response = client.chat.completions.create(
-            model="gpt-5-mini",
-            response_format={"type": "json_object"},
+        backend = get_active_backend()
+        response = backend.generate(LLMRequest(
+            model=backend_model(backend, "gpt-5-mini"),
+            json_mode=True,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": user_content},
             ],
-        )
-        content = response.choices[0].message.content
-        parsed = json.loads(content)
+        ))
+        parsed = parse_json_content(response)
         return {
             "list_of_agents": parsed.get("list_of_agents", parsed.get("plan", tool_calls)),
             "redo": bool(parsed.get("redo", False)),
             "reason": parsed.get("reason", ""),
         }
-    except Exception:
+    except Exception as exc:
+        logger.warning("Plan observer degraded to the original plan: %s", exc)
         return default
 
 
@@ -161,77 +135,24 @@ def action_observer_agent(image_path: str, tool_result: Any) -> dict:
         )
 
     try:
-        client = _get_client()
-        if client is None:
-            return default
-        
-        response = client.chat.completions.create(
-            model="gpt-5-mini",
-            response_format={"type": "json_object"},
+        backend = get_active_backend()
+        response = backend.generate(LLMRequest(
+            model=backend_model(backend, "gpt-5-mini"),
+            json_mode=True,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": user_content},
             ],
-        )
-        content = response.choices[0].message.content
-        parsed = json.loads(content)
+        ))
+        parsed = parse_json_content(response)
         return {
             "redo": bool(parsed.get("redo", False)),
             "reason": parsed.get("reason", ""),
             "list_of_agents": parsed.get("list_of_agents", []),
         }
-    except Exception:
+    except Exception as exc:
+        logger.warning("Action observer degraded to no redo: %s", exc)
         return default
-
-
-def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, **kwargs):
-    """
-    Generic API call retry function with exponential backoff support.
-    
-    Args:
-        func: function to call
-        max_retries: maximum number of retries
-        base_delay: base delay time (seconds)
-        backoff_factor: backoff factor (retry delay = base_delay * backoff_factor^attempt)
-        *args, **kwargs: parameters passed to func
-    
-    Returns:
-        return value of func
-    
-    Raises:
-        exception from the final attempt
-    """
-    last_exception = None
-    
-    for attempt in range(max_retries):
-        try:
-            return func(*args, **kwargs)
-        except (InternalServerError, RateLimitError, APIError) as e:
-            last_exception = e
-            error_code = getattr(e, 'status_code', None) or getattr(e, 'code', None)
-            error_message = str(e)
-            
-            # Check whether this is a 503 error or another retryable error
-            if error_code == 503 or 'overloaded' in error_message.lower() or '503' in error_message:
-                if attempt < max_retries - 1:
-                    delay = base_delay * (backoff_factor ** attempt)
-                    print(f"⚠️ API call failed (503/overloaded), attempt {attempt + 1}/{max_retries}. Retrying in {delay:.1f} seconds...")
-                    time.sleep(delay)
-                    continue
-                else:
-                    print(f"❌ API call failed, reached maximum retries ({max_retries})")
-                    raise
-            else:
-                # Other error types, raise directly
-                raise
-        except Exception as e:
-            # Other unknown errors, raise directly
-            raise
-    
-    # If all retries failed
-    if last_exception:
-        raise last_exception
-    raise RuntimeError("API call failed, unknown error")
 
 
 def plan_observer_agent_OS(
@@ -249,12 +170,8 @@ def plan_observer_agent_OS(
         dict: {"list_of_agents": list, "redo": bool, "reason": str}
     """
     default = {"list_of_agents": tool_calls, "redo": False, "reason": ""}
-    base_url = base_url or os.getenv("VLLM_BASE_URL", os.getenv("OLLAMA_BASE_URL", "http://localhost:8000/v1"))
-    api_key = api_key or os.getenv("VLLM_API_KEY", os.getenv("OLLAMA_API_KEY", "EMPTY"))
-
-    client_os = OpenAI(
-        base_url=base_url,
-        api_key=api_key,
+    backend = get_active_backend(
+        provider="local", model=model_name, base_url=base_url, api_key=api_key
     )
 
     base64_image = _encode_image(image_path)
@@ -271,26 +188,16 @@ def plan_observer_agent_OS(
         )
 
     try:
-        response = retry_api_call(
-            client_os.chat.completions.create,
-            max_retries=5,
-            base_delay=3,
-            backoff_factor=2,
-            model=model_name,
+        response = backend.generate(LLMRequest(
+            model=backend_model(backend, model_name),
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": user_content},
             ],
             temperature=0,
-            response_format={"type": "json_object"},
-        )
-        content = response.choices[0].message.content
-
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            print(f"⚠️ Warning: plan_observer_agent_OS could not parse JSON, returning the original plan")
-            return default
+            json_mode=True,
+        ))
+        parsed = parse_json_content(response)
         
         return {
             "list_of_agents": parsed.get("list_of_agents", parsed.get("plan", tool_calls)),
@@ -298,7 +205,7 @@ def plan_observer_agent_OS(
             "reason": parsed.get("reason", ""),
         }
     except Exception as e:
-        print(f"⚠️ Warning: plan_observer_agent_OS error: {e}, returning the original plan")
+        logger.warning("Local plan observer degraded to the original plan: %s", e)
         return default
 
 
@@ -317,12 +224,8 @@ def action_observer_agent_OS(
         dict: {"redo": bool, "reason": str, "list_of_agents": list}
     """
     default = {"redo": False, "reason": "", "list_of_agents": []}
-    base_url = base_url or os.getenv("VLLM_BASE_URL", os.getenv("OLLAMA_BASE_URL", "http://localhost:8000/v1"))
-    api_key = api_key or os.getenv("VLLM_API_KEY", os.getenv("OLLAMA_API_KEY", "EMPTY"))
-
-    client_os = OpenAI(
-        base_url=base_url,
-        api_key=api_key,
+    backend = get_active_backend(
+        provider="local", model=model_name, base_url=base_url, api_key=api_key
     )
 
     base64_image = _encode_image(image_path)
@@ -339,26 +242,16 @@ def action_observer_agent_OS(
         )
 
     try:
-        response = retry_api_call(
-            client_os.chat.completions.create,
-            max_retries=5,
-            base_delay=3,
-            backoff_factor=2,
-            model=model_name,
+        response = backend.generate(LLMRequest(
+            model=backend_model(backend, model_name),
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": user_content},
             ],
             temperature=0,
-            response_format={"type": "json_object"},
-        )
-        content = response.choices[0].message.content
-
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            print(f"⚠️ Warning: action_observer_agent_OS could not parse JSON, returning no redo")
-            return default
+            json_mode=True,
+        ))
+        parsed = parse_json_content(response)
         
         return {
             "redo": bool(parsed.get("redo", False)),
@@ -366,5 +259,5 @@ def action_observer_agent_OS(
             "list_of_agents": parsed.get("list_of_agents", []),
         }
     except Exception as e:
-        print(f"⚠️ Warning: action_observer_agent_OS error: {e}, returning no redo")
+        logger.warning("Local action observer degraded to no redo: %s", e)
         return default

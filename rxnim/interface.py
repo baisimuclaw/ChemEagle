@@ -18,6 +18,20 @@ from huggingface_hub import hf_hub_download
 import easyocr
 
 
+def _model_asset(filename):
+    """Resolve an explicitly staged worker model without changing model code."""
+    model_dir = os.getenv("CHEMEAGLE_VISION_MODEL_DIR")
+    if model_dir:
+        path = os.path.join(os.path.expanduser(model_dir), filename)
+        if os.path.exists(path):
+            return path
+        if os.getenv("CHEMEAGLE_OFFLINE") == "1":
+            raise FileNotFoundError(
+                f"Required offline ChemEAGLE model is missing: {path}"
+            )
+    return hf_hub_download("CYF200127/ChemEAGLEModel", filename)
+
+
 class RxnIM:
 
     def __init__(self, model_path, device=None):
@@ -76,7 +90,7 @@ class RxnIM:
         return model
 
     def get_molnextr(self):
-        ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "molnextr.pth")
+        ckpt_path = _model_asset("molnextr.pth")
         molnextr = MolNexTR(ckpt_path, device=self.device)
         return molnextr
 
@@ -222,7 +236,7 @@ class MolDetect:
         return model
 
     def get_molnextr(self): 
-        ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "molnextr.pth")
+        ckpt_path = _model_asset("molnextr.pth")
         molnextr = MolNexTR(ckpt_path, device=self.device)
         return molnextr
 
@@ -285,5 +299,4 @@ class MolDetect:
         plt.close(fig)
         return results
             
-
 

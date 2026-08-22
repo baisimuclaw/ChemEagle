@@ -1,85 +1,120 @@
 import sys
-import torch
 import json
-from chemietoolkit import ChemIEToolkit
 import cv2
 from PIL import Image
 import json
 import sys
-import torch
-from rxnim import RxnIM
 import json
 from molnextr.chemistry import _convert_graph_to_smiles
-from openai import AzureOpenAI, OpenAI, InternalServerError, RateLimitError, APIError
 import base64
 import numpy as np
 from chemietoolkit import utils
 from PIL import Image
 import os
 from typing import Optional
-import time
 from chemietoolkit.helper import _patch_to_reaction
+from chemeagle_llm import (
+    LLMRequest,
+    backend_model,
+    bind_image_tools,
+    get_active_backend,
+    parse_json_content,
+)
+from chemeagle_vision.proxies import vision_rxnim as model1
+
+
+REACTION_EMPTY_MAX_ATTEMPTS = 3
+
+
+def _predict_reaction_with_empty_retries(
+    image_path: str,
+    *,
+    max_attempts: int = REACTION_EMPTY_MAX_ATTEMPTS,
+):
+    """Retry RxnIM only when inference succeeds but detects no reaction.
+
+    Exceptions deliberately propagate unchanged. After the final empty result,
+    return an empty list so downstream agents omit the reaction instead of
+    substituting an image-only LLM guess.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    for attempt in range(1, max_attempts + 1):
+        raw_prediction = model1.predict_image_file(
+            image_path,
+            molnextr=True,
+            ocr=True,
+        )
+        if raw_prediction:
+            return raw_prediction
+        if attempt < max_attempts:
+            print(
+                "Warning: RxnIM returned no reaction "
+                f"(attempt {attempt}/{max_attempts}); retrying."
+            )
+
+    print(
+        "Warning: RxnIM returned no reaction after "
+        f"{max_attempts} attempts; the reaction will be omitted."
+    )
+    return []
 
 
 
-def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, **kwargs):
-    last_exception = None
-    
-    for attempt in range(max_retries):
-        try:
-            return func(*args, **kwargs)
-        except (InternalServerError, RateLimitError, APIError) as e:
-            last_exception = e
-            error_code = getattr(e, 'status_code', None) or getattr(e, 'code', None)
-            error_message = str(e)
-            
-            # Check whether this is a 503 error or another retryable error
-            if error_code == 503 or 'overloaded' in error_message.lower() or '503' in error_message:
-                if attempt < max_retries - 1:
-                    delay = base_delay * (backoff_factor ** attempt)
-                    print(f"⚠️ API call failed (503/overloaded), attempt {attempt + 1}/{max_retries}. Retrying in {delay:.1f} seconds...")
-                    time.sleep(delay)
-                    continue
-                else:
-                    print(f"❌ API call failed, reached maximum retries ({max_retries})")
-                    raise
-            else:
-                # Other error types, raise directly
-                raise
-        except Exception as e:
-            # Other unknown errors, raise directly
-            raise
-    
-    # If all retries failed
-    if last_exception:
-        raise last_exception
-    raise RuntimeError("API call failed, unknown error")
+def _run_image_tool_agent(
+    backend,
+    image_path,
+    messages,
+    tools,
+    model_name,
+    handlers,
+    *,
+    extra=None,
+    require_tool_call=True,
+    followup_on_no_tool_call=False,
+    ignore_tool_arguments=False,
+    temperature=None,
+):
+    def wrap_tool_result(name, handler):
+        def invoke(trusted_image_path):
+            return {
+                "image_path": trusted_image_path,
+                name: handler(trusted_image_path),
+            }
 
-ckpt_path = "./rxn.ckpt"
-model1 = RxnIM(ckpt_path, device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-model = ChemIEToolkit(device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')) 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        return invoke
 
-API_KEY = os.getenv("API_KEY")
-if not API_KEY:
-    raise ValueError("Please set API_KEY")
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
-API_VERSION = os.getenv("API_VERSION")
+    response = backend.run_tool_loop(
+        LLMRequest(
+            model=backend_model(backend, model_name),
+            messages=messages,
+            json_mode=True,
+            temperature=temperature,
+            tool_choice="auto",
+            extra=extra or {},
+            require_tool_call=require_tool_call,
+            followup_on_no_tool_call=followup_on_no_tool_call,
+            validate_tool_arguments=False,
+            ignore_tool_arguments=ignore_tool_arguments,
+            defer_json_validation_for_tools=True,
+        ),
+        tools,
+        bind_image_tools(
+            image_path,
+            {
+                name: wrap_tool_result(name, handler)
+                for name, handler in handlers.items()
+            },
+        ),
+    )
+    return parse_json_content(response)
 
 
-def get_reaction(image_path: str) -> dict:
-    '''
-    Returns a structured dictionary of reactions extracted from the image,
-    including reactants, conditions, and products, with their smiles, text, and bbox.
-    '''
-    image_file = image_path
-    image = Image.open(image_file)
-
-    image_file = image_path
-    raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
-    #print(f'raw_prediction:{raw_prediction}')
-
-    # Ensure raw_prediction is treated as a list directly
+def _reaction_summary_from_raw(raw_prediction) -> dict:
+    """Build the compact tool payload while retaining raw results for callers."""
+    if not raw_prediction:
+        return {}
     structured_output = {}
     for section_key in ['reactants', 'conditions', 'products']:
         if section_key in raw_prediction[0]:
@@ -101,9 +136,28 @@ def get_reaction(image_path: str) -> dict:
                     if "text" in item:
                         condition_data["text"] = item.get("text", [])
                     structured_output[section_key].append(condition_data)
-    #print(f'structured_output:{structured_output}')
-
     return structured_output
+
+
+def get_reaction(image_path: str) -> dict:
+    '''
+    Returns a structured dictionary of reactions extracted from the image,
+    including reactants, conditions, and products, with their smiles, text, and bbox.
+    '''
+    raw_prediction = _predict_reaction_with_empty_retries(image_path)
+    return _reaction_summary_from_raw(raw_prediction)
+
+
+def _caching_reaction_tool(cache):
+    """Return a request-scoped tool that avoids redundant GPU inference."""
+    def invoke(image_path: str) -> dict:
+        if "raw_prediction" not in cache:
+            cache["raw_prediction"] = _predict_reaction_with_empty_retries(
+                image_path
+            )
+        return _reaction_summary_from_raw(cache["raw_prediction"])
+
+    return invoke
 
 
 
@@ -113,7 +167,7 @@ def get_full_reaction(image_path: str) -> dict:
     including reactants, conditions, and products, with their smiles, text, and bbox.
     '''
     image_file = image_path
-    raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+    raw_prediction = _predict_reaction_with_empty_retries(image_file)
     for reaction in raw_prediction:
         for section in ("reactants", "products", "conditions"):
             for entry in reaction.get(section, []):
@@ -143,12 +197,7 @@ def get_reaction_withatoms(image_path: str) -> dict:
     Returns:
         dict: organized reaction data, including reactants, products, and reaction templates.
     """
-    # Initialize OpenChemIE model and Azure OpenAI client
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
-    )
+    backend = get_active_backend()
 
     # Load image and encode as Base64
     def encode_image(image_path: str):
@@ -193,102 +242,16 @@ def get_reaction_withatoms(image_path: str) -> dict:
         }
     ]
 
-    # Call GPT API
-    response = client.chat.completions.create(
-    model = 'gpt-4o',
-    temperature = 0,
-    response_format={ 'type': 'json_object' },
-    messages = [
-        {'role': 'system', 'content': 'You are a helpful assistant.'},
-        {
-            'role': 'user',
-            'content': [
-                {
-                    'type': 'text',
-                    'text': prompt
-                },
-                {
-                    'type': 'image_url',
-                    'image_url': {
-                        'url': f'data:image/png;base64,{base64_image}'
-                    }
-                }
-            ]},
-    ],
-    tools = tools)
-    
-# Step 1: Tool mapping table
-    TOOL_MAP = {
-        'get_reaction': get_reaction,
-    }
-
-    # Step 2: Handle multiple tool calls
-    tool_calls = response.choices[0].message.tool_calls
-    results = []
-
-    # Iterate through each tool call
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        tool_arguments = tool_call.function.arguments
-        tool_call_id = tool_call.id
-        
-        tool_args = json.loads(tool_arguments)
-        
-        if tool_name in TOOL_MAP:
-            # Call tool and get result
-            tool_result = TOOL_MAP[tool_name](image_path)
-        else:
-            raise ValueError(f"Unknown tool called: {tool_name}")
-        
-        # Save each tool-call result
-        results.append({
-            'role': 'tool',
-            'name': tool_name,  # Gemini API requires the name field
-            'content': json.dumps({
-                'image_path': image_path,
-                f'{tool_name}':(tool_result),
-            }),
-            'tool_call_id': tool_call_id,
-        })
-
-
-# Prepare the chat completion payload
-    completion_payload = {
-        'model': 'gpt-4o',
-        'messages': [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': prompt
-                    },
-                    {
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': f'data:image/png;base64,{base64_image}'
-                        }
-                    }
-                ]
-            },
-            response.choices[0].message,
-            *results
-            ],
-    }
-
-# Generate new response
-    response = client.chat.completions.create(
-        model=completion_payload["model"],
-        messages=completion_payload["messages"],
-        response_format={ 'type': 'json_object' },
-        temperature=0
+    raw_prediction_cache = {}
+    gpt_output = _run_image_tool_agent(
+        backend,
+        image_path,
+        messages,
+        tools,
+        "gpt-4o",
+        {"get_reaction": _caching_reaction_tool(raw_prediction_cache)},
+        temperature=0,
     )
-
-
-    
-    # Get GPT-generated result
-    gpt_output = json.loads(response.choices[0].message.content)
     #print(f"gpt_output1:{gpt_output}")
 
     
@@ -298,10 +261,12 @@ def get_reaction_withatoms(image_path: str) -> dict:
         including reactants, conditions, and products, with their smiles, text, and bbox.
         '''
         image_file = image_path
-        raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+        raw_prediction = _predict_reaction_with_empty_retries(image_file)
         return raw_prediction
     
-    input2 = get_reaction_full(image_path)
+    input2 = raw_prediction_cache.get("raw_prediction")
+    if input2 is None:
+        input2 = get_reaction_full(image_path)
 
 
 
@@ -342,7 +307,11 @@ def get_reaction_withatoms(image_path: str) -> dict:
 
         return input2
     
-    updated_data = [update_input_with_symbols(gpt_output, input2[0], _convert_graph_to_smiles)]
+    if not input2:
+        print("Warning: no RxnIM reaction available; omitting the reaction result.")
+        return []
+    raw_reaction = input2[0]
+    updated_data = [update_input_with_symbols(gpt_output, raw_reaction, _convert_graph_to_smiles)]
 
     return updated_data
 
@@ -359,14 +328,7 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
     Returns:
         dict: organized reaction data, including reactants, products, and reaction templates.
     """
-    # Configure API Key and Azure Endpoint
-    
-
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
-    )
+    backend = get_active_backend()
 
     # Load image and encode as Base64
     def encode_image(image_path: str):
@@ -411,102 +373,15 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
         }
     ]
 
-    # Call GPT API
-    response = client.chat.completions.create(
-    model = 'gpt-5-mini',
-    #temperature = 0,
-    response_format={ 'type': 'json_object' },
-    messages = [
-        {'role': 'system', 'content': 'You are a helpful assistant.'},
-        {
-            'role': 'user',
-            'content': [
-                {
-                    'type': 'text',
-                    'text': prompt
-                },
-                {
-                    'type': 'image_url',
-                    'image_url': {
-                        'url': f'data:image/png;base64,{base64_image}'
-                    }
-                }
-            ]},
-    ],
-    tools = tools)
-    
-# Step 1: Tool mapping table
-    TOOL_MAP = {
-        'get_reaction': get_reaction,
-    }
-
-    # Step 2: Handle multiple tool calls
-    tool_calls = response.choices[0].message.tool_calls
-    results = []
-
-    # Iterate through each tool call
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        tool_arguments = tool_call.function.arguments
-        tool_call_id = tool_call.id
-        
-        tool_args = json.loads(tool_arguments)
-        
-        if tool_name in TOOL_MAP:
-            # Call tool and get result
-            tool_result = TOOL_MAP[tool_name](image_path)
-        else:
-            raise ValueError(f"Unknown tool called: {tool_name}")
-        
-        # Save each tool-call result
-        results.append({
-            'role': 'tool',
-            'name': tool_name,  # Gemini API requires the name field
-            'content': json.dumps({
-                'image_path': image_path,
-                f'{tool_name}':(tool_result),
-            }),
-            'tool_call_id': tool_call_id,
-        })
-
-
-# Prepare the chat completion payload
-    completion_payload = {
-        'model': 'gpt-5-mini',
-        'messages': [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': prompt
-                    },
-                    {
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': f'data:image/png;base64,{base64_image}'
-                        }
-                    }
-                ]
-            },
-            response.choices[0].message,
-            *results
-            ],
-    }
-
-# Generate new response
-    response = client.chat.completions.create(
-        model=completion_payload["model"],
-        messages=completion_payload["messages"],
-        response_format={ 'type': 'json_object' },
-        #temperature=0
+    raw_prediction_cache = {}
+    gpt_output = _run_image_tool_agent(
+        backend,
+        image_path,
+        messages,
+        tools,
+        "gpt-5-mini",
+        {"get_reaction": _caching_reaction_tool(raw_prediction_cache)},
     )
-
-
-    
-    # Get GPT-generated result
-    gpt_output = json.loads(response.choices[0].message.content)
     print(f"gpt_output_rxn:{gpt_output}")
 
     
@@ -517,10 +392,12 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
         '''
 
         image_file = image_path
-        raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+        raw_prediction = _predict_reaction_with_empty_retries(image_file)
         return raw_prediction
     
-    input2 = get_reaction_full(image_path)
+    input2 = raw_prediction_cache.get("raw_prediction")
+    if input2 is None:
+        input2 = get_reaction_full(image_path)
 
 
 
@@ -565,7 +442,11 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
 
         return input2
     
-    updated_data = [update_input_with_symbols(gpt_output, input2[0], _convert_graph_to_smiles)]
+    if not input2:
+        print("Warning: no RxnIM reaction available; omitting the reaction result.")
+        return []
+    raw_reaction = input2[0]
+    updated_data = [update_input_with_symbols(gpt_output, raw_reaction, _convert_graph_to_smiles)]
     updated_data = _patch_to_reaction(updated_data)
     print(f"rxn_agent_output:{updated_data}")
 
@@ -581,10 +462,9 @@ def get_reaction_withatoms_correctR_OS(
 ) -> dict:
  
 
-    base_url = base_url or os.getenv("VLLM_BASE_URL", os.getenv("OLLAMA_BASE_URL", "http://localhost:8000/v1"))
-    api_key = api_key or os.getenv("VLLM_API_KEY", os.getenv("OLLAMA_API_KEY", "EMPTY"))
-
-    client = OpenAI(
+    backend = get_active_backend(
+        provider="local",
+        model=model_name,
         base_url=base_url,
         api_key=api_key,
     )
@@ -632,104 +512,19 @@ def get_reaction_withatoms_correctR_OS(
         }
     ]
 
-    # Call GPT API (with retry mechanism)
-    response = retry_api_call(
-        client.chat.completions.create,
-        max_retries=5,
-        base_delay=3,
-        backoff_factor=2,
-        model=model_name,
+    raw_prediction_cache = {}
+    gpt_output = _run_image_tool_agent(
+        backend,
+        image_path,
+        messages,
+        tools,
+        model_name,
+        {"get_reaction": _caching_reaction_tool(raw_prediction_cache)},
+        extra={"extra_body": _get_extra_body(model_name)},
+        require_tool_call=False,
+        followup_on_no_tool_call=True,
         temperature=0,
-        #response_format={'type': 'json_object'},  # vLLM does not support using response_format and tools simultaneously
-        messages=messages,
-        tools=tools,
-        tool_choice="auto",
     )
-    
-    # Step 1: Tool mapping table
-    TOOL_MAP = {
-        'get_reaction': get_reaction,
-    }
-
-    # Step 2: Handle multiple tool calls
-    tool_calls = response.choices[0].message.tool_calls or []
-    results = []
-
-    # Iterate through each tool call
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        tool_arguments = tool_call.function.arguments
-        tool_call_id = tool_call.id
-        
-        tool_args = json.loads(tool_arguments)
-        
-        if tool_name in TOOL_MAP:
-            # Call tool and get result
-            tool_result = TOOL_MAP[tool_name](image_path)
-        else:
-            raise ValueError(f"Unknown tool called: {tool_name}")
-        
-        # Save each tool-call result
-        results.append({
-            'role': 'tool',
-            'name': tool_name,  # Gemini API requires the name field
-            'content': json.dumps({
-                'image_path': image_path,
-                f'{tool_name}':(tool_result),
-            }),
-            'tool_call_id': tool_call_id,
-        })
-
-    # Prepare the chat completion payload
-    completion_payload = {
-        'model': model_name,
-        'messages': [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': prompt
-                    },
-                    {
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': f'data:image/png;base64,{base64_image}'
-                        }
-                    }
-                ]
-            },
-            response.choices[0].message,
-            *results
-            ],
-    }
-
-    # Generate new response (with retry mechanism)
-    response = retry_api_call(
-        client.chat.completions.create,
-        max_retries=5,
-        base_delay=3,
-        backoff_factor=2,
-        model=completion_payload["model"],
-        messages=completion_payload["messages"],
-        response_format={'type': 'json_object'},
-        temperature=0
-    )
-
-    # Get GPT-generated result
-    raw_content = response.choices[0].message.content
-
-    try:
-        gpt_output = json.loads(raw_content)
-        print(f"DEBUG [OS]: Successfully parsed JSON directly")
-    except json.JSONDecodeError:
-        print(f"ERROR [OS]: Failed to parse JSON from model response")
-        print(f"Raw content (last 2000 chars):\n{raw_content[-2000:]}")
-        raise json.JSONDecodeError(
-            f"Could not parse JSON from model response. Content may not be valid JSON.",
-            raw_content, 0
-        )
     
     print(f"gpt_output_rxn:{gpt_output}")
 
@@ -740,10 +535,12 @@ def get_reaction_withatoms_correctR_OS(
         '''
 
         image_file = image_path
-        raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+        raw_prediction = _predict_reaction_with_empty_retries(image_file)
         return raw_prediction
     
-    input2 = get_reaction_full(image_path)
+    input2 = raw_prediction_cache.get("raw_prediction")
+    if input2 is None:
+        input2 = get_reaction_full(image_path)
 
     def update_input_with_symbols(input1, input2, conversion_function):
         symbol_mapping = {}
@@ -786,7 +583,11 @@ def get_reaction_withatoms_correctR_OS(
 
         return input2
     
-    updated_data = [update_input_with_symbols(gpt_output, input2[0], _convert_graph_to_smiles)]
+    if not input2:
+        print("Warning: no RxnIM reaction available; omitting the reaction result.")
+        return []
+    raw_reaction = input2[0]
+    updated_data = [update_input_with_symbols(gpt_output, raw_reaction, _convert_graph_to_smiles)]
     updated_data = _patch_to_reaction(updated_data)
     print(f"rxn_agent_output:{updated_data}")
 
@@ -799,13 +600,20 @@ def _get_extra_body(model_name: str) -> dict:
 
 def _tesseract_ocr_image(image_path: str) -> str:
     import pytesseract
+    # Reuse the same executable discovery used by the text agent.  This is
+    # especially important when the orchestrator's conda environment contains
+    # Tesseract but that environment's bin directory is not inherited by the
+    # process launching this condition tool.
+    from get_text_agent import configure_tesseract
+
+    configure_tesseract()
     img = Image.open(image_path)
     raw_text = pytesseract.image_to_string(img)
     return raw_text
 
 
 def get_reaction_c(image_path: str) -> dict:
-    raw_prediction = model1.predict_image_file(image_path, molnextr=True, ocr=True)
+    raw_prediction = _predict_reaction_with_empty_retries(image_path)
     conditions_per_reaction = []
     for reaction in raw_prediction:
         conds = reaction.get('conditions', [])
@@ -821,11 +629,7 @@ def get_reaction_c(image_path: str) -> dict:
 
 
 def get_reaction_con(image_path: str) -> dict:
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT,
-    )
+    backend = get_active_backend()
 
     def encode_image(p: str):
         with open(p, "rb") as f:
@@ -886,63 +690,22 @@ def get_reaction_con(image_path: str) -> dict:
         },
     ]
 
-    response = client.chat.completions.create(
-        model='gpt-5-mini',
-        response_format={'type': 'json_object'},
-        messages=messages,
-        tools=tools,
+    gpt_output = _run_image_tool_agent(
+        backend,
+        image_path,
+        messages,
+        tools,
+        "gpt-5-mini",
+        {
+            "TesseractOCR": _tesseract_ocr_image,
+            "get_reaction_c": get_reaction_c,
+        },
+        require_tool_call=False,
+        followup_on_no_tool_call=True,
+        ignore_tool_arguments=True,
     )
-
-    TOOL_MAP = {
-        'TesseractOCR': _tesseract_ocr_image,
-        'get_reaction_c': get_reaction_c,
-    }
-
-    tool_calls = response.choices[0].message.tool_calls or []
-    results = []
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        tool_call_id = tool_call.id
-        if tool_name in TOOL_MAP:
-            tool_result = TOOL_MAP[tool_name](image_path)
-        else:
-            raise ValueError(f"Unknown tool called: {tool_name}")
-        results.append({
-            'role': 'tool',
-            'name': tool_name,
-            'content': json.dumps({
-                'image_path': image_path,
-                f'{tool_name}': tool_result,
-            }),
-            'tool_call_id': tool_call_id,
-        })
-
-    completion_payload = {
-        'model': 'gpt-5-mini',
-        'messages': [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': prompt},
-                    {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{base64_image}'}},
-                ],
-            },
-            response.choices[0].message,
-            *results,
-        ],
-    }
-
-    response = client.chat.completions.create(
-        model=completion_payload['model'],
-        messages=completion_payload['messages'],
-        response_format={'type': 'json_object'},
-    )
-
-    gpt_output = json.loads(response.choices[0].message.content)
     print(f"gpt_output_con:{gpt_output}")
     return gpt_output
-
 
 def get_reaction_con_OS(
     image_path: str,
@@ -951,10 +714,12 @@ def get_reaction_con_OS(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> dict:
-    base_url = base_url or os.getenv("VLLM_BASE_URL", os.getenv("OLLAMA_BASE_URL", "http://localhost:8000/v1"))
-    api_key = api_key or os.getenv("VLLM_API_KEY", os.getenv("OLLAMA_API_KEY", "EMPTY"))
-
-    client = OpenAI(base_url=base_url, api_key=api_key)
+    backend = get_active_backend(
+        provider="local",
+        model=model_name,
+        base_url=base_url,
+        api_key=api_key,
+    )
 
     def encode_image(p: str):
         with open(p, "rb") as f:
@@ -1015,82 +780,22 @@ def get_reaction_con_OS(
         },
     ]
 
-    response = retry_api_call(
-        client.chat.completions.create,
-        max_retries=5,
-        base_delay=3,
-        backoff_factor=2,
-        model=model_name,
+    gpt_output = _run_image_tool_agent(
+        backend,
+        image_path,
+        messages,
+        tools,
+        model_name,
+        {
+            "TesseractOCR": _tesseract_ocr_image,
+            "get_reaction_c": get_reaction_c,
+        },
+        extra={"extra_body": _get_extra_body(model_name)},
+        require_tool_call=False,
+        followup_on_no_tool_call=True,
+        ignore_tool_arguments=True,
         temperature=0,
-        messages=messages,
-        tools=tools,
-        tool_choice="auto",
-        extra_body=_get_extra_body(model_name),
     )
-
-    TOOL_MAP = {
-        'TesseractOCR': _tesseract_ocr_image,
-        'get_reaction_c': get_reaction_c,
-    }
-
-    tool_calls = response.choices[0].message.tool_calls or []
-    results = []
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        tool_call_id = tool_call.id
-        if tool_name in TOOL_MAP:
-            tool_result = TOOL_MAP[tool_name](image_path)
-        else:
-            raise ValueError(f"Unknown tool called: {tool_name}")
-        results.append({
-            'role': 'tool',
-            'name': tool_name,
-            'content': json.dumps({
-                'image_path': image_path,
-                f'{tool_name}': tool_result,
-            }),
-            'tool_call_id': tool_call_id,
-        })
-
-    completion_payload = {
-        'model': model_name,
-        'messages': [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': prompt},
-                    {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{base64_image}'}},
-                ],
-            },
-            response.choices[0].message,
-            *results,
-        ],
-    }
-
-    response = retry_api_call(
-        client.chat.completions.create,
-        max_retries=5,
-        base_delay=3,
-        backoff_factor=2,
-        model=completion_payload['model'],
-        messages=completion_payload['messages'],
-        temperature=0,
-        response_format={'type': 'json_object'},
-        extra_body=_get_extra_body(model_name),
-    )
-
-    raw_content = response.choices[0].message.content
-    try:
-        gpt_output = json.loads(raw_content)
-        print(f"DEBUG [con OS]: Successfully parsed JSON directly")
-    except json.JSONDecodeError:
-        print(f"ERROR [con OS]: Failed to parse JSON from model response")
-        print(f"Raw content (last 2000 chars):\n{raw_content[-2000:]}")
-        raise json.JSONDecodeError(
-            "Could not parse JSON from model response. Content may not be valid JSON.",
-            raw_content, 0,
-        )
 
     print(f"gpt_output_con:{gpt_output}")
     return gpt_output

@@ -1,30 +1,23 @@
 from PIL import Image
 import pytesseract
-from chemrxnextractor import RxnExtractor
-from openai import AzureOpenAI, OpenAI
 from typing import Optional
-model_dir = "./cre_models_v0.1"
-rxn_extractor = RxnExtractor(model_dir)
+from chemeagle_llm import (
+    LLMRequest,
+    backend_model,
+    bind_image_tools,
+    get_active_backend,
+    parse_json_content,
+)
 import json
-import torch
-from chemiener import ChemNER
-from huggingface_hub import hf_hub_download
-ckpt_path = "./ner.ckpt"
-model2 = ChemNER(ckpt_path, device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 import base64
 import os
 import shutil
 import re
-import time
-from openai import InternalServerError, RateLimitError, APIError
-
-
-
-API_KEY = os.getenv("API_KEY")
-if not API_KEY:
-    raise ValueError("Please set API_KEY")
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
-API_VERSION = os.getenv("API_VERSION")
+import sys
+from chemeagle_vision.proxies import (
+    vision_chemner as model2,
+    vision_chemrxnextractor as rxn_extractor,
+)
 
 
 # Configure Tesseract OCR path (Windows)
@@ -38,8 +31,8 @@ def configure_tesseract():
     # Common Windows installation paths (including custom paths under the project directory)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     possible_paths = [
-        # User-specified absolute path (highest priority)
-        r"F:\chemeagle\Tesseract-OCR\tesseract.exe",
+        # Isolated conda/virtual environment used by the orchestrator.
+        os.path.join(os.path.dirname(sys.executable), "tesseract"),
         # Custom path under the project directory
         os.path.join(script_dir, "Tesseract-OCR", "tesseract.exe"),
         os.path.join(os.path.dirname(script_dir), "Tesseract-OCR", "tesseract.exe"),
@@ -47,7 +40,6 @@ def configure_tesseract():
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
         os.path.expanduser(r"~\AppData\Local\Tesseract-OCR\tesseract.exe"),
-        r"C:\Users\Administrator\AppData\Local\Tesseract-OCR\tesseract.exe",
     ]
     
     # First try to find it in PATH
@@ -79,15 +71,11 @@ def configure_tesseract():
     print("\nPlease do one of the following:")
     print("1. Make sure Tesseract OCR is installed correctly")
     print("2. Or set the path manually:")
-    print("   pytesseract.pytesseract.tesseract_cmd = r'F:\\chemeagle\\Tesseract-OCR\\tesseract.exe'")
+    print("   pytesseract.pytesseract.tesseract_cmd = r'C:\\path\\to\\tesseract.exe'")
     raise FileNotFoundError(
         "Tesseract OCR is not installed or not in PATH."
         "Please visit https://github.com/UB-Mannheim/tesseract/wiki for installation."
     )
-
-# Initialize Tesseract configuration
-configure_tesseract()
-
 
 def merge_sentences(sentences):
     """
@@ -151,6 +139,12 @@ def split_text_into_sentences(text: str) -> list:
     return result
 
 
+def _ocr_image_text(image_path: str) -> str:
+    configure_tesseract()
+    with Image.open(image_path) as img:
+        return pytesseract.image_to_string(img)
+
+
 def extract_reactions_from_text_in_image(image_path: str) -> dict:
     """
     Extract text from a chemical reaction image and identify reactions.
@@ -165,13 +159,8 @@ def extract_reactions_from_text_in_image(image_path: str) -> dict:
         'reactions': reaction list output by RxnExtractor (list)
       }
     """
-    # Model directory and device parameters (adjust as needed)
-    model_dir = "./cre_models_v0.1"
-    device = "cpu"
-
     # 1. OCR text extraction
-    img = Image.open(image_path)
-    raw_text = pytesseract.image_to_string(img)
+    raw_text = _ocr_image_text(os.path.abspath(image_path))
 
     # 2. Merge multi-line text into a single paragraph
     lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
@@ -180,11 +169,7 @@ def extract_reactions_from_text_in_image(image_path: str) -> dict:
     # 3. Split text into sentences to avoid length issues
     sentences = split_text_into_sentences(paragraph)
     
-    # 4. Initialize chemical reaction extractor
-    use_cuda = (device.lower() == "cuda")
-    rxn_extractor = RxnExtractor(model_dir, use_cuda=use_cuda)
-
-    # 5. Extract reactions for each sentence (avoid length mismatch issues)
+    # 4. Extract reactions for each sentence on the active vision worker.
     all_reactions = []
     try:
         reactions = rxn_extractor.get_reactions(sentences)
@@ -204,24 +189,19 @@ def extract_reactions_from_text_in_image(image_path: str) -> dict:
     return all_reactions 
 
 def NER_from_text_in_image(image_path: str) -> dict:
-    # Model directory and device parameters (adjust as needed)
-    model_dir = "./cre_models_v0.1"
-    device = "cpu"
-
     # 1. OCR text extraction
-    img = Image.open(image_path)
-    raw_text = pytesseract.image_to_string(img)
+    raw_text = _ocr_image_text(os.path.abspath(image_path))
 
     # 2. Merge multi-line text into a single paragraph
     lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
     paragraph = " ".join(lines)
+    # Upstream ChemNER receives the complete OCR paragraph.
+    ner_text = paragraph
+    if not ner_text.strip():
+        return []
 
-    # 3. Initialize chemical reaction extractor
-    use_cuda = (device.lower() == "cuda")
-    rxn_extractor = RxnExtractor(model_dir, use_cuda=use_cuda)
-
-    # 4. Extract reactions (note: get_reactions requires list input)
-    predictions = model2.predict_strings([paragraph])
+    # 3. Extract named entities on the active vision worker.
+    predictions = model2.predict_strings([ner_text])
 
     return predictions 
 
@@ -236,11 +216,7 @@ def text_extraction_agent(image_path: str, graphical_input: Optional[dict] = Non
     to perform OCR, reaction extraction, and chemical NER on a single image.
     Returns a merged JSON result.
     """
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
-    )
+    backend = get_active_backend()
 
     # Encode image as Base64
     with open(image_path, "rb") as f:
@@ -339,111 +315,25 @@ Here is my step-by-step analysis:
         }
     ]
 
-    # First API call: let GPT decide which tools to invoke
-    response1 = client.chat.completions.create(
-        model="gpt-5-mini",
-        messages=messages,
-        tools=tools,
-        #temperature=0,
-        response_format={"type": "json_object"}
+    response = backend.run_tool_loop(
+        LLMRequest(
+            model=backend_model(backend, "gpt-5-mini"),
+            messages=messages,
+            json_mode=True,
+            tool_choice="auto",
+            unknown_tool_policy="skip",
+            ignore_tool_arguments=True,
+        ),
+        tools,
+        bind_image_tools(
+            image_path,
+            {
+                "extract_reactions_from_text_in_image": extract_reactions_from_text_in_image,
+                "NER_from_text_in_image": NER_from_text_in_image,
+            },
+        ),
     )
-
-    # Get assistant message with tool calls
-    assistant_message = response1.choices[0].message
-    
-    # Execute each requested tool
-    tool_calls = assistant_message.tool_calls
-    if not tool_calls:
-        # If no tool calls, return the response directly
-        return json.loads(response1.choices[0].message.content) if response1.choices[0].message.content else {}
-    
-    tool_results_msgs = []
-    for call in tool_calls:
-        name = call.function.name
-        tool_call_id = call.id
-        
-        if name == "extract_reactions_from_text_in_image":
-            result = extract_reactions_from_text_in_image(image_path)
-        elif name == "NER_from_text_in_image":
-            result = NER_from_text_in_image(image_path)
-        else:
-            continue
-        
-        # Correct format for tool messages: need tool_call_id, not tool_name
-        tool_results_msgs.append({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": json.dumps(result, ensure_ascii=False)
-        })
-
-    # Second API call: pass tool outputs back to GPT for final response
-    # Add assistant message and tool results to messages
-    messages.append(assistant_message)
-    messages.extend(tool_results_msgs)
-    
-    response2 = client.chat.completions.create(
-        model="gpt-5-mini",
-        messages=messages,
-        #   temperature=0,
-        response_format={"type": "json_object"}
-    )
-
-    raw_content = response2.choices[0].message.content
-    try:
-        return json.loads(raw_content)
-    except json.JSONDecodeError:
-        print(f"[WARN] text_extraction_agent: failed to parse JSON, returning raw text. First 500 chars:\n{raw_content[:500]}")
-        return {"annotated_text": raw_content}
-
-
-def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, **kwargs):
-    """
-    Generic API call retry function with exponential backoff support.
-    
-    Args:
-        func: function to call
-        max_retries: maximum number of retries
-        base_delay: base delay time (seconds)
-        backoff_factor: backoff factor (retry delay = base_delay * backoff_factor^attempt)
-        *args, **kwargs: parameters passed to func
-    
-    Returns:
-        return value of func
-    
-    Raises:
-        exception from the final attempt
-    """
-    last_exception = None
-    
-    for attempt in range(max_retries):
-        try:
-            return func(*args, **kwargs)
-        except (InternalServerError, RateLimitError, APIError) as e:
-            last_exception = e
-            error_code = getattr(e, 'status_code', None) or getattr(e, 'code', None)
-            error_message = str(e)
-            
-            # Check whether this is a 503 error or another retryable error
-            if error_code == 503 or 'overloaded' in error_message.lower() or '503' in error_message:
-                if attempt < max_retries - 1:
-                    delay = base_delay * (backoff_factor ** attempt)
-                    print(f"⚠️ API call failed (503/overloaded), attempt {attempt + 1}/{max_retries}. Retrying in {delay:.1f} seconds...")
-                    time.sleep(delay)
-                    continue
-                else:
-                    print(f"❌ API call failed, reached maximum retries ({max_retries})")
-                    raise
-            else:
-                # Other error types, raise directly
-                raise
-        except Exception as e:
-            # Other unknown errors, raise directly
-            raise
-    
-    # If all retries failed
-    if last_exception:
-        raise last_exception
-    raise RuntimeError("API call failed, unknown error")
+    return parse_json_content(response)
 
 
 def text_extraction_agent_OS(
@@ -454,10 +344,9 @@ def text_extraction_agent_OS(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> dict:
-    base_url = base_url or os.getenv("VLLM_BASE_URL", os.getenv("OLLAMA_BASE_URL", "http://localhost:8000/v1"))
-    api_key = api_key or os.getenv("VLLM_API_KEY", os.getenv("OLLAMA_API_KEY", "EMPTY"))
-
-    client = OpenAI(
+    backend = get_active_backend(
+        provider="local",
+        model=model_name,
         base_url=base_url,
         api_key=api_key,
     )
@@ -561,88 +450,23 @@ Here is my step-by-step analysis:
         }
     ]
 
-    # First API call: let GPT decide which tools to invoke
-    # Note: vLLM may not support response_format and tools simultaneously
-    try:
-        response1 = retry_api_call(
-            client.chat.completions.create,
-            max_retries=5,
-            base_delay=3,
-            backoff_factor=2,
-            model=model_name,
+    response = backend.run_tool_loop(
+        LLMRequest(
+            model=backend_model(backend, model_name),
             messages=messages,
-            tools=tools,
-            tool_choice="auto",
+            json_mode=True,
             temperature=0,
-            # response_format={"type": "json_object"},  # vLLM does not support using response_format and tools simultaneously
-        )
-    except Exception as e:
-        error_msg = str(e)
-        if "tool" in error_msg.lower() or "tool-call" in error_msg.lower():
-            print(f"⚠️ Warning: vLLM does not support tool calling: {e}")
-            print("Tip: restart the vLLM container with the following arguments:")
-            print("  --enable-auto-tool-choice --tool-call-parser auto")
-            print("Or continue using Ollama (native tool-calling support)")
-            raise
-        else:
-            raise
-
-    # Get assistant message with tool calls
-    assistant_message = response1.choices[0].message
-    
-    # Execute each requested tool
-    tool_calls = assistant_message.tool_calls
-    if not tool_calls:
-        # If no tool calls, try to parse response directly
-        raw_content = response1.choices[0].message.content
-        if raw_content:
-            try:
-                return json.loads(raw_content)
-            except json.JSONDecodeError:
-                return {"content": raw_content}
-        return {}
-    
-    tool_results_msgs = []
-    for call in tool_calls:
-        name = call.function.name
-        tool_call_id = call.id
-        
-        if name == "extract_reactions_from_text_in_image":
-            result = extract_reactions_from_text_in_image(image_path)
-        elif name == "NER_from_text_in_image":
-            result = NER_from_text_in_image(image_path)
-        else:
-            continue
-        
-        # Correct format for tool messages: need tool_call_id and name (for some APIs)
-        tool_results_msgs.append({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "name": name,  # Some APIs (like Gemini) require name field
-            "content": json.dumps(result, ensure_ascii=False)
-        })
-
-    # Second API call: pass tool outputs back to GPT for final response
-    # Add assistant message and tool results to messages
-    messages.append(assistant_message)
-    messages.extend(tool_results_msgs)
-    
-    response2 = retry_api_call(
-        client.chat.completions.create,
-        max_retries=5,
-        base_delay=3,
-        backoff_factor=2,
-        model=model_name,
-        messages=messages,
-        temperature=0,
-        response_format={"type": "json_object"}
+            tool_choice="auto",
+            unknown_tool_policy="skip",
+            ignore_tool_arguments=True,
+        ),
+        tools,
+        bind_image_tools(
+            image_path,
+            {
+                "extract_reactions_from_text_in_image": extract_reactions_from_text_in_image,
+                "NER_from_text_in_image": NER_from_text_in_image,
+            },
+        ),
     )
-
-
-    raw_content = response2.choices[0].message.content
-    try:
-        return json.loads(raw_content)
-    except json.JSONDecodeError:
-        print(f"[WARN] text_extraction_agent: failed to parse JSON, returning raw text. First 500 chars:\n{raw_content[:500]}")
-        return {"annotated_text": raw_content}
-    return raw_content
+    return parse_json_content(response)

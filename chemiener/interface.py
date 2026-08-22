@@ -14,9 +14,9 @@ from .utils import get_class_to_index
 
 class ChemNER:
 
-    def __init__(self, model_path, device = None, cache_dir = None):
+    def __init__(self, model_path, device=None, cache_dir=None, roberta_checkpoint=None):
 
-        self.args = self._get_args(cache_dir)
+        self.args = self._get_args(cache_dir, roberta_checkpoint)
 
         states = torch.load(model_path, map_location = torch.device('cpu'))
 
@@ -35,10 +35,10 @@ class ChemNER:
 
         self.index_to_class = {self.class_to_index[key]: key for key in self.class_to_index}
 
-    def _get_args(self, cache_dir):
+    def _get_args(self, cache_dir, roberta_checkpoint=None):
         parser = argparse.ArgumentParser()
 
-        parser.add_argument('--roberta_checkpoint', default = 'biobert-large-cased', type=str, help='which roberta config to use')
+        parser.add_argument('--roberta_checkpoint', default = roberta_checkpoint or 'biobert-large-cased', type=str, help='which roberta config to use')
 
         parser.add_argument('--corpus', default = "chemdner", type=str, help="which corpus should the tags be from")
 
@@ -121,4 +121,3 @@ class ChemNER:
 
 
             
-

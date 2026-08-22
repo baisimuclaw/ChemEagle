@@ -1,0 +1,1272 @@
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import queue
+import threading
+import time
+import unittest
+from unittest import mock
+
+from chemeagle_llm.codex_app_server import (
+    CodexAppServerBackend,
+    CodexAppServerClient,
+)
+from chemeagle_llm.config import BackendConfig
+from chemeagle_llm.errors import (
+    AuthenticationError,
+    BackendCancelledError,
+    BackendProcessError,
+    BackendRateLimitError,
+    BackendTimeoutError,
+    ToolExecutionError,
+    UnsupportedCapabilityError,
+)
+from chemeagle_llm.types import LLMRequest, LLMResponse, LLMToolOutput
+
+
+class _QueueStream:
+    def __init__(self):
+        self.lines = queue.Queue()
+
+    def put(self, message):
+        self.lines.put(json.dumps(message) + "\n")
+
+    def close(self):
+        self.lines.put(None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.lines.get(timeout=5)
+        if item is None:
+            raise StopIteration
+        return item
+
+
+class _ScriptedStdin:
+    def __init__(self, callback):
+        self.callback = callback
+
+    def write(self, value):
+        self.callback(json.loads(value))
+        return len(value)
+
+    def flush(self):
+        return None
+
+
+class _FakeProcess:
+    def __init__(self, script):
+        self.stdout = _QueueStream()
+        self.stderr = _QueueStream()
+        self.stdin = _ScriptedStdin(script.handle)
+        self.returncode = None
+        script.process = self
+
+    def poll(self):
+        return self.returncode
+
+
+class _CodexScript:
+    def __init__(
+        self,
+        *,
+        account_type="chatgpt",
+        requested_tool=None,
+        tool_arguments=None,
+        rate_limited=False,
+        turn_texts=None,
+        hold_turn=False,
+        hold_turns=0,
+        hold_tool_turns=0,
+        suppress_tool_call=False,
+        tool_call_turns=None,
+        overload_method=None,
+        close_method=None,
+        ignore_method=None,
+        failed_turns=0,
+        failed_error_info="serverOverloaded",
+    ):
+        self.process = None
+        self.account_type = account_type
+        self.requested_tool = requested_tool
+        self.tool_arguments = {"value": 3} if tool_arguments is None else tool_arguments
+        self.rate_limited = rate_limited
+        self.turn_texts = list(turn_texts or ['{"reactions": []}'])
+        self.hold_turn = hold_turn
+        self.hold_turns = hold_turns
+        self.hold_tool_turns = hold_tool_turns
+        self.suppress_tool_call = suppress_tool_call
+        self.tool_call_turns = (
+            None if tool_call_turns is None else set(tool_call_turns)
+        )
+        self.overload_method = overload_method
+        self.close_method = close_method
+        self.ignore_method = ignore_method
+        self.failed_turns = failed_turns
+        self.failed_error_info = failed_error_info
+        self.overload_count = 0
+        self.turn_count = 0
+        self.thread_count = 0
+        self.initialized_received = False
+        self.login_types = []
+        self.interrupts = []
+        self.dynamic_tools = []
+        self.dynamic_reply = None
+        self.turn_input = None
+        self.turn_inputs = []
+        self.output_schema = None
+        self.injected_histories = []
+
+    def send(self, message):
+        self.process.stdout.put(message)
+
+    def response(self, request, result):
+        self.send({"id": request["id"], "result": result})
+
+    def finish_turn(self, turn_id="turn-1"):
+        if self.turn_count <= self.failed_turns:
+            self.send(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {
+                            "id": turn_id,
+                            "status": "failed",
+                            "items": [],
+                            "error": {
+                                "message": "transient turn failure",
+                                "codexErrorInfo": self.failed_error_info,
+                            },
+                        },
+                    },
+                }
+            )
+            return
+        index = min(max(self.turn_count - 1, 0), len(self.turn_texts) - 1)
+        self.send(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": turn_id,
+                        "status": "completed",
+                        "items": [
+                            {
+                                "id": "message-1",
+                                "type": "agentMessage",
+                                "text": self.turn_texts[index],
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+
+    def handle(self, message):
+        if "method" not in message:
+            if message.get("id") == 900:
+                self.dynamic_reply = message.get("result")
+                if self.turn_count > self.hold_tool_turns:
+                    self.finish_turn(f"turn-{self.turn_count}")
+            return
+        method = message["method"]
+        if "id" not in message:  # initialized notification
+            if method == "initialized":
+                self.initialized_received = True
+            return
+        if method == self.close_method:
+            self.process.returncode = 17
+            self.process.stdout.close()
+            return
+        if method == self.ignore_method:
+            return
+        if method == self.overload_method and self.overload_count == 0:
+            self.overload_count += 1
+            self.send(
+                {
+                    "id": message["id"],
+                    "error": {"code": -32001, "message": "overloaded"},
+                }
+            )
+            return
+        if method == "initialize":
+            self.response(message, {"userAgent": "fake", "codexHome": "/fake"})
+        elif method == "account/read":
+            account = None
+            if self.account_type:
+                account = {"type": self.account_type}
+                if self.account_type == "chatgpt":
+                    account.update({"email": "test@example.com", "planType": "pro"})
+            self.response(message, {"account": account, "requiresOpenaiAuth": True})
+        elif method == "account/rateLimits/read":
+            used = 100 if self.rate_limited else 1
+            self.response(message, {"rateLimits": {"primary": {"usedPercent": used}}})
+        elif method == "account/login/start":
+            login_type = message["params"]["type"]
+            self.login_types.append(login_type)
+            if login_type == "chatgptDeviceCode":
+                result = {
+                    "type": login_type,
+                    "loginId": "login-1",
+                    "verificationUrl": "https://example.test/device",
+                    "userCode": "ABCD-EFGH",
+                }
+            else:
+                result = {
+                    "type": login_type,
+                    "loginId": "login-1",
+                    "authUrl": "https://example.test/oauth?secret=value",
+                }
+            self.response(message, result)
+            self.send(
+                {
+                    "method": "account/login/completed",
+                    "params": {"loginId": "login-1", "success": True},
+                }
+            )
+        elif method == "account/logout":
+            self.response(message, {})
+        elif method == "model/list":
+            self.response(
+                message,
+                {
+                    "data": [
+                        {
+                            "id": "available-model",
+                            "model": "available-model",
+                            "displayName": "Available",
+                            "hidden": False,
+                            "isDefault": True,
+                        }
+                    ],
+                    "nextCursor": None,
+                },
+            )
+        elif method == "thread/start":
+            self.thread_count += 1
+            self.dynamic_tools = message["params"].get("dynamicTools") or []
+            self.response(
+                message,
+                {"thread": {"id": "thread-1"}, "model": "available-model"},
+            )
+        elif method == "thread/inject_items":
+            self.injected_histories.append(message["params"]["items"])
+            self.response(message, {})
+        elif method == "turn/start":
+            self.turn_count += 1
+            turn_id = f"turn-{self.turn_count}"
+            self.turn_input = message["params"].get("input")
+            self.turn_inputs.append(self.turn_input)
+            self.output_schema = message["params"].get("outputSchema")
+            self.response(message, {"turn": {"id": turn_id, "status": "inProgress"}})
+            if (
+                self.dynamic_tools
+                and not self.suppress_tool_call
+                and (
+                    self.tool_call_turns is None
+                    or self.turn_count in self.tool_call_turns
+                )
+            ):
+                self.send(
+                    {
+                        "id": 900,
+                        "method": "item/tool/call",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": turn_id,
+                            "callId": "call-1",
+                            "tool": self.requested_tool or self.dynamic_tools[0]["name"],
+                            "arguments": self.tool_arguments,
+                        },
+                    }
+                )
+            elif not self.hold_turn and self.turn_count > self.hold_turns:
+                self.finish_turn(turn_id)
+        elif method == "turn/interrupt":
+            self.interrupts.append(message["params"])
+            self.response(message, {})
+        else:
+            self.send(
+                {
+                    "id": message["id"],
+                    "error": {"code": -32601, "message": f"unknown {method}"},
+                }
+            )
+
+
+class CodexBackendTests(unittest.TestCase):
+    def make_backend(
+        self,
+        *,
+        account_type="chatgpt",
+        max_retries=1,
+        timeout=5,
+        tool_timeout=3600,
+        **script_kwargs,
+    ):
+        config = BackendConfig(
+            provider="codex",
+            model="available-model",
+            timeout=timeout,
+            tool_timeout=tool_timeout,
+            max_retries=max_retries,
+        )
+        script = _CodexScript(account_type=account_type, **script_kwargs)
+        process = _FakeProcess(script)
+        client = CodexAppServerClient(config, process=process)
+        return CodexAppServerBackend(config, client=client), script
+
+    def test_binary_version_is_checked_before_managed_spawn(self):
+        config = BackendConfig(
+            provider="codex", codex_binary="codex", codex_min_version="0.146.0"
+        )
+        client = CodexAppServerClient(config)
+        old = mock.Mock(stdout="codex-cli 0.100.0", stderr="")
+        with mock.patch("chemeagle_llm.codex_app_server.subprocess.run", return_value=old):
+            with self.assertRaises(UnsupportedCapabilityError):
+                client._check_version()
+        with mock.patch(
+            "chemeagle_llm.codex_app_server.subprocess.run",
+            side_effect=FileNotFoundError,
+        ):
+            with self.assertRaises(BackendProcessError):
+                client._check_version()
+
+    def test_dynamic_tools_use_response_window_not_tool_execution_cap(self):
+        config = BackendConfig(
+            provider="codex", model="available-model", timeout=5, tool_timeout=1234
+        )
+        backend = CodexAppServerBackend(config, client=mock.Mock())
+        with mock.patch.object(backend, "_run", return_value=mock.sentinel.response) as run:
+            result = backend.run_tool_loop(
+                LLMRequest(messages=[{"role": "user", "content": "tool"}]),
+                [],
+                {},
+            )
+        self.assertIs(result, mock.sentinel.response)
+        self.assertEqual(run.call_args.args[0].timeout, 5)
+
+    def test_ignored_tool_arguments_share_one_retry_cache_entry(self):
+        backend = CodexAppServerBackend(
+            BackendConfig(provider="codex", model="available-model"),
+            client=mock.Mock(),
+        )
+        handler = mock.Mock(return_value={"status": "ok"})
+
+        def fake_run(_request, *, tools=None, executor=None):
+            self.assertIsNotNone(tools)
+            self.assertIsNotNone(executor)
+            executor["lookup"](value=1)
+            executor["lookup"](value=999)
+            return LLMResponse(content='{"ok": true}', metadata={"tool_trace": []})
+
+        with mock.patch.object(backend, "_run", side_effect=fake_run):
+            response = backend.run_tool_loop(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "lookup"}],
+                    json_mode=True,
+                    ignore_tool_arguments=True,
+                ),
+                [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                {"lookup": handler},
+            )
+
+        self.assertEqual(json.loads(response.content), {"ok": True})
+        handler.assert_called_once_with()
+
+    def test_no_tool_call_still_uses_upstream_annotated_followup(self):
+        config = BackendConfig(
+            provider="codex", model="available-model", timeout=5
+        )
+        backend = CodexAppServerBackend(config, client=mock.Mock())
+        preliminary = LLMResponse(content='{"preliminary": true}')
+        final = LLMResponse(content='{"final": true}')
+        request = LLMRequest(
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "original image"},
+            ],
+            json_mode=True,
+            tool_followup_content=[
+                {"type": "text", "text": "same prompt"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,ANNOTATED"},
+                },
+            ],
+        )
+        with mock.patch.object(
+            backend, "_run", side_effect=[preliminary, final]
+        ) as run:
+            response = backend.run_tool_loop(request, [], {})
+
+        self.assertIs(response, final)
+        followup = run.call_args_list[1].args[0]
+        self.assertEqual(
+            [message["role"] for message in followup.messages],
+            ["system", "user", "assistant"],
+        )
+        self.assertEqual(followup.messages[1]["content"][0]["text"], "same prompt")
+        self.assertEqual(followup.messages[2]["content"], preliminary.content)
+
+    def test_no_tool_call_can_use_upstream_original_input_followup(self):
+        config = BackendConfig(provider="codex", model="available-model", timeout=5)
+        backend = CodexAppServerBackend(config, client=mock.Mock())
+        preliminary = LLMResponse(content='{"preliminary": true}', metadata={"tool_trace": []})
+        final = LLMResponse(content='{"final": true}')
+        request = LLMRequest(
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "original image"},
+            ],
+            json_mode=True,
+            followup_on_no_tool_call=True,
+        )
+        with mock.patch.object(backend, "_run", side_effect=[preliminary, final]) as run:
+            response = backend.run_tool_loop(request, [], {})
+
+        self.assertIs(response, final)
+        followup = run.call_args_list[1].args[0]
+        self.assertEqual(
+            [message["role"] for message in followup.messages],
+            ["system", "user", "assistant"],
+        )
+        self.assertEqual(followup.messages[1]["content"], "original image")
+
+    def test_intermediate_non_json_does_not_block_no_tool_followup(self):
+        backend, script = self.make_backend(
+            max_retries=1,
+            suppress_tool_call=True,
+            turn_texts=["not-json", '{"final": true}'],
+        )
+        try:
+            response = backend.run_tool_loop(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "Use lookup"}],
+                    json_mode=True,
+                    followup_on_no_tool_call=True,
+                    defer_json_validation_for_tools=True,
+                ),
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                executor={"lookup": lambda **_arguments: {"ok": True}},
+            )
+            self.assertEqual(json.loads(response.content), {"final": True})
+            self.assertEqual(script.turn_count, 2)
+        finally:
+            backend.close()
+
+    def test_json_correction_preserves_successful_tool_history(self):
+        backend, script = self.make_backend(
+            max_retries=2,
+            tool_call_turns={1},
+            tool_arguments={},
+            turn_texts=["not-json", '{"final": true}'],
+        )
+        calls = []
+        try:
+            response = backend.run_tool_loop(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "Use lookup"}],
+                    json_mode=True,
+                    require_tool_call=True,
+                    defer_json_validation_for_tools=True,
+                ),
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                executor={
+                    "lookup": lambda **arguments: (
+                        calls.append(arguments) or {"grounded": True}
+                    )
+                },
+            )
+            self.assertEqual(json.loads(response.content), {"final": True})
+            self.assertEqual(calls, [{}])
+            self.assertEqual(script.turn_count, 2)
+            self.assertEqual(script.thread_count, 2)
+            self.assertEqual(
+                [item["type"] for item in script.injected_histories[-1]],
+                ["message", "function_call", "function_call_output", "message"],
+            )
+            self.assertIn("corrected JSON object", script.turn_inputs[-1][0]["text"])
+        finally:
+            backend.close()
+
+    def test_json_correction_cannot_hide_tool_failure(self):
+        backend, script = self.make_backend(
+            max_retries=2,
+            tool_call_turns={1},
+            turn_texts=["not-json", '{"ungrounded": true}'],
+        )
+        try:
+            with self.assertRaises(ToolExecutionError):
+                backend.run_tool_loop(
+                    LLMRequest(
+                        messages=[{"role": "user", "content": "Use lookup"}],
+                        json_mode=True,
+                        defer_json_validation_for_tools=True,
+                    ),
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                    executor={
+                        "lookup": lambda **_arguments: (
+                            (_ for _ in ()).throw(RuntimeError("vision failed"))
+                        )
+                    },
+                )
+            self.assertEqual(script.turn_count, 1)
+            self.assertFalse(script.dynamic_reply["success"])
+        finally:
+            backend.close()
+
+    def test_upstream_unknown_tool_skip_and_single_tool_fallback(self):
+        backend, script = self.make_backend(requested_tool="not-allowed")
+        try:
+            response = backend.run_tool_loop(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "tool"}],
+                    json_mode=True,
+                    unknown_tool_policy="skip",
+                ),
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                executor={"lookup": lambda **_arguments: {"ok": True}},
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertFalse(script.dynamic_reply["success"])
+        finally:
+            backend.close()
+
+        backend, script = self.make_backend(
+            requested_tool="not-allowed",
+            tool_arguments="not-an-object",
+        )
+        try:
+            response = backend.run_tool_loop(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "tool"}],
+                    json_mode=True,
+                    unknown_tool_policy="fallback",
+                    ignore_tool_arguments=True,
+                ),
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                executor={"lookup": lambda **arguments: {"arguments": arguments}},
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertTrue(script.dynamic_reply["success"])
+            payload = json.loads(script.dynamic_reply["contentItems"][0]["text"])
+            self.assertEqual(payload, {"arguments": {}})
+        finally:
+            backend.close()
+
+    def test_non_tool_server_requests_remain_safely_denied(self):
+        client = CodexAppServerClient(
+            BackendConfig(provider="codex"),
+            process=mock.Mock(),
+        )
+        with mock.patch.object(client, "_send_result") as send_result:
+            client._handle_server_request_sync(
+                {"id": 7, "method": "applyPatchApproval", "params": {}}
+            )
+
+        self.assertEqual(send_result.call_args.args[0], 7)
+        self.assertIn("denied", send_result.call_args.args[1]["decision"])
+
+    def test_managed_spawn_uses_stdio_controlled_cwd_and_strips_api_keys(self):
+        captured = {}
+
+        class Spawned:
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        def factory(command, **kwargs):
+            captured["command"] = command
+            captured.update(kwargs)
+            return Spawned()
+
+        config = BackendConfig(provider="codex", codex_min_version="0.146.0")
+        client = CodexAppServerClient(config, process_factory=factory)
+        version = mock.Mock(stdout="codex-cli 0.146.0", stderr="")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "platform-secret",
+                "AZURE_OPENAI_API_KEY": "azure-secret",
+                "VLLM_API_KEY": "local-secret",
+            },
+        ), mock.patch(
+            "chemeagle_llm.codex_app_server.subprocess.run", return_value=version
+        ):
+            client._spawn()
+        try:
+            self.assertEqual(captured["command"], ["codex", "app-server", "--stdio"])
+            self.assertTrue(captured["cwd"].startswith("/tmp/chemeagle-codex-"))
+            self.assertNotIn("OPENAI_API_KEY", captured["env"])
+            self.assertNotIn("AZURE_OPENAI_API_KEY", captured["env"])
+            self.assertNotIn("VLLM_API_KEY", captured["env"])
+        finally:
+            client.close()
+
+    def test_text_image_schema_and_subscription_account(self):
+        backend, script = self.make_backend()
+        schema = {
+            "type": "object",
+            "properties": {
+                "reactions": {
+                    "type": "array",
+                    "items": {"type": "object", "additionalProperties": False},
+                }
+            },
+            "required": ["reactions"],
+            "additionalProperties": False,
+        }
+        try:
+            response = backend.generate(
+                LLMRequest(
+                    messages=[
+                        {"role": "system", "content": "Extract chemistry."},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Read the image"},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                                },
+                            ],
+                        },
+                    ],
+                    output_schema=schema,
+                )
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertEqual(script.output_schema, schema)
+            self.assertTrue(any(item["type"] == "image" for item in script.turn_input))
+            self.assertEqual(backend.models()[0]["id"], "available-model")
+            self.assertTrue(script.initialized_received)
+        finally:
+            backend.close()
+
+    def test_dynamic_tool_bridge_is_whitelisted(self):
+        backend, script = self.make_backend()
+        try:
+            response = backend.run_tool_loop(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "Use lookup"}],
+                    json_mode=True,
+                ),
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "description": "safe lookup",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"value": {"type": "integer"}},
+                            },
+                        },
+                    }
+                ],
+                executor={"lookup": lambda value: {"doubled": value * 2}},
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertEqual(script.dynamic_reply["success"], True)
+            self.assertIsNone(script.output_schema)
+            tool_payload = json.loads(script.dynamic_reply["contentItems"][0]["text"])
+            self.assertEqual(tool_payload, {"doubled": 6})
+        finally:
+            backend.close()
+
+    def test_dynamic_tool_may_issue_nested_rpc_without_reader_deadlock(self):
+        backend, script = self.make_backend()
+        try:
+            response = backend.run_tool_loop(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "Use lookup"}],
+                    json_mode=True,
+                ),
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"value": {"type": "integer"}},
+                            },
+                        },
+                    }
+                ],
+                executor={
+                    "lookup": lambda **_kwargs: {
+                        "model": backend.models()[0]["id"]
+                    }
+                },
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            payload = json.loads(script.dynamic_reply["contentItems"][0]["text"])
+            self.assertEqual(payload, {"model": "available-model"})
+        finally:
+            backend.close()
+
+    def test_nested_turns_keep_independent_tool_allowlists(self):
+        client = CodexAppServerClient(
+            BackendConfig(provider="codex"),
+            process=mock.Mock(),
+        )
+        calls = []
+        with mock.patch.object(client, "_send_result") as send_result:
+            with client.tool_executor(
+                {"outer_tool": lambda **_kwargs: calls.append("outer") or "outer"}
+            ) as outer:
+                outer.bind("thread-outer")
+                with client.tool_executor(
+                    {"inner_tool": lambda **_kwargs: calls.append("inner") or "inner"}
+                ) as inner:
+                    inner.bind("thread-inner")
+                    client._execute_tool_call(
+                        1,
+                        {
+                            "threadId": "thread-outer",
+                            "turnId": "turn-outer",
+                            "callId": "outer-call",
+                            "tool": "outer_tool",
+                            "arguments": {},
+                        },
+                    )
+                    client._execute_tool_call(
+                        2,
+                        {
+                            "threadId": "thread-inner",
+                            "turnId": "turn-inner",
+                            "callId": "inner-call",
+                            "tool": "inner_tool",
+                            "arguments": {},
+                        },
+                    )
+                client._execute_tool_call(
+                    3,
+                    {
+                        "threadId": "thread-outer",
+                        "turnId": "turn-outer",
+                        "callId": "outer-call-2",
+                        "tool": "outer_tool",
+                        "arguments": {},
+                    },
+                )
+
+        self.assertEqual(calls, ["outer", "inner", "outer"])
+        self.assertEqual(send_result.call_count, 3)
+        self.assertEqual(client._tool_executors, {})
+
+    def test_tool_execution_pauses_response_window(self):
+        backend, script = self.make_backend(
+            timeout=0.05,
+            tool_timeout=1,
+        )
+
+        def slow_lookup(**_arguments):
+            time.sleep(0.12)
+            return {"status": "ok"}
+
+        try:
+            response = backend.run_tool_loop(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "Use lookup"}],
+                    json_mode=True,
+                ),
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                executor={"lookup": slow_lookup},
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertEqual(script.turn_count, 1)
+            self.assertEqual(script.interrupts, [])
+        finally:
+            backend.close()
+
+    def test_turn_notification_refreshes_silence_window(self):
+        client = object.__new__(CodexAppServerClient)
+        client._turn_activity_lock = threading.Lock()
+        client._turn_activity = {
+            "turn-1": {
+                "active_tools": 0,
+                "active_since": None,
+                "last_activity": 0.0,
+            }
+        }
+
+        client._mark_notification_activity(
+            {"method": "item/updated", "params": {"turnId": "turn-1"}}
+        )
+
+        self.assertGreater(client._turn_activity["turn-1"]["last_activity"], 0.0)
+
+    def test_timeout_retries_original_request_three_times(self):
+        backend, script = self.make_backend(
+            max_retries=3,
+            timeout=0.04,
+            hold_turns=2,
+        )
+        try:
+            response = backend.generate(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "same request"}],
+                    json_mode=True,
+                )
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertEqual(script.turn_count, 3)
+            self.assertEqual(script.thread_count, 3)
+            self.assertEqual(len(script.interrupts), 2)
+            self.assertTrue(
+                all(value == script.turn_inputs[0] for value in script.turn_inputs)
+            )
+        finally:
+            backend.close()
+
+    def test_retryable_failed_turn_uses_fresh_thread_and_is_bounded(self):
+        backend, script = self.make_backend(
+            max_retries=3,
+            failed_turns=2,
+            failed_error_info={"responseStreamDisconnected": {}},
+        )
+        try:
+            response = backend.generate(
+                LLMRequest(messages=[{"role": "user", "content": "same"}])
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertEqual(script.turn_count, 3)
+            self.assertEqual(script.thread_count, 3)
+        finally:
+            backend.close()
+
+        backend, script = self.make_backend(
+            max_retries=3,
+            failed_turns=3,
+            failed_error_info="badRequest",
+        )
+        try:
+            with self.assertRaises(BackendProcessError):
+                backend.generate(
+                    LLMRequest(messages=[{"role": "user", "content": "bad"}])
+                )
+            self.assertEqual(script.turn_count, 1)
+            self.assertEqual(script.thread_count, 1)
+        finally:
+            backend.close()
+
+    def test_third_timeout_exits_and_identical_tool_call_is_cached(self):
+        backend, script = self.make_backend(
+            max_retries=3,
+            timeout=0.03,
+            hold_turn=True,
+        )
+        try:
+            with self.assertRaises(BackendTimeoutError):
+                backend.generate(
+                    LLMRequest(messages=[{"role": "user", "content": "never"}])
+                )
+            self.assertEqual(script.turn_count, 3)
+            self.assertEqual(script.thread_count, 3)
+            self.assertEqual(len(script.interrupts), 3)
+        finally:
+            backend.close()
+
+        handler = mock.Mock(return_value={"status": "cached"})
+        backend, script = self.make_backend(
+            max_retries=2,
+            timeout=0.04,
+            hold_tool_turns=1,
+        )
+        try:
+            response = backend.run_tool_loop(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "Use lookup"}],
+                    json_mode=True,
+                ),
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"value": {"type": "integer"}},
+                            },
+                        },
+                    }
+                ],
+                executor={"lookup": handler},
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertEqual(script.turn_count, 2)
+            self.assertEqual(script.thread_count, 2)
+            self.assertEqual(len(script.interrupts), 1)
+            handler.assert_called_once_with(value=3)
+        finally:
+            backend.close()
+
+    def test_api_key_account_is_rejected_instead_of_silently_billed(self):
+        backend, _ = self.make_backend(account_type="apiKey")
+        try:
+            with self.assertRaises(AuthenticationError):
+                backend.generate(
+                    LLMRequest(messages=[{"role": "user", "content": "hello"}])
+                )
+        finally:
+            backend.close()
+
+    def test_missing_account_is_rejected(self):
+        backend, _ = self.make_backend(account_type=None)
+        try:
+            with self.assertRaises(AuthenticationError):
+                backend.generate(LLMRequest(messages=[{"role": "user", "content": "x"}]))
+        finally:
+            backend.close()
+
+    def test_browser_and_device_code_login_events(self):
+        for device_code, expected_type in (
+            (False, "chatgpt"),
+            (True, "chatgptDeviceCode"),
+        ):
+            with self.subTest(device_code=device_code):
+                backend, script = self.make_backend()
+                try:
+                    started = backend.login(device_code=device_code)
+                    completed = backend.wait_login(
+                        started["loginId"], after=started["eventCursor"]
+                    )
+                    self.assertTrue(completed["success"])
+                    self.assertEqual(script.login_types, [expected_type])
+                finally:
+                    backend.close()
+
+    def _run_dynamic_failure(self, **script_kwargs):
+        backend, script = self.make_backend(**script_kwargs)
+        try:
+            with self.assertRaises(ToolExecutionError):
+                backend.run_tool_loop(
+                    LLMRequest(messages=[{"role": "user", "content": "tool"}], json_mode=True),
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"value": {"type": "integer"}},
+                                },
+                            },
+                        }
+                    ],
+                    executor={"lookup": lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom"))},
+                )
+            return script.dynamic_reply
+        finally:
+            backend.close()
+
+    def test_dynamic_tool_unknown_arguments_and_exception_are_structured_failures(self):
+        unknown = self._run_dynamic_failure(requested_tool="not-allowed")
+        self.assertFalse(unknown["success"])
+        self.assertIn("disallowed", unknown["contentItems"][0]["text"])
+
+        invalid = self._run_dynamic_failure(tool_arguments="not-an-object")
+        self.assertFalse(invalid["success"])
+        self.assertIn("JSON object", invalid["contentItems"][0]["text"])
+
+        wrong_type = self._run_dynamic_failure(tool_arguments={"value": "bad"})
+        self.assertFalse(wrong_type["success"])
+        self.assertIn("expected JSON integer", wrong_type["contentItems"][0]["text"])
+
+        failed = self._run_dynamic_failure()
+        self.assertFalse(failed["success"])
+        self.assertIn("RuntimeError", failed["contentItems"][0]["text"])
+
+    def test_structured_output_is_corrected_within_retry_limit(self):
+        backend, script = self.make_backend(
+            max_retries=2,
+            turn_texts=["not-json", '{"reactions": []}'],
+        )
+        try:
+            response = backend.generate(
+                LLMRequest(messages=[{"role": "user", "content": "json"}], json_mode=True)
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertEqual(script.turn_count, 2)
+            self.assertIsNone(script.output_schema)
+        finally:
+            backend.close()
+
+    def test_generic_json_mode_locally_requires_an_object(self):
+        backend, script = self.make_backend(
+            max_retries=2,
+            turn_texts=["[]", '{"reactions": []}'],
+        )
+        try:
+            response = backend.generate(
+                LLMRequest(messages=[{"role": "user", "content": "json"}], json_mode=True)
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertEqual(script.turn_count, 2)
+            self.assertIsNone(script.output_schema)
+        finally:
+            backend.close()
+
+    def test_required_dynamic_tool_must_be_observed(self):
+        config = BackendConfig(provider="codex", model="available-model", timeout=5)
+        backend = CodexAppServerBackend(config, client=mock.Mock())
+        response = LLMResponse(content='{"reactions": []}', metadata={"tool_trace": []})
+        with mock.patch.object(backend, "_run", return_value=response):
+            with self.assertRaises(ToolExecutionError):
+                backend.run_tool_loop(
+                    LLMRequest(
+                        messages=[{"role": "user", "content": "Use lookup"}],
+                        json_mode=True,
+                        require_tool_call=True,
+                    ),
+                    [{"type": "function", "function": {"name": "lookup"}}],
+                    {"lookup": lambda: {}},
+                )
+
+    def test_dynamic_tool_rebuilds_upstream_annotated_second_completion(self):
+        backend, script = self.make_backend()
+        try:
+            backend.run_tool_loop(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "Use lookup"}],
+                    json_mode=True,
+                ),
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                executor={
+                    "lookup": lambda **_kwargs: LLMToolOutput(
+                        value={"molecule": "CC"},
+                        supplemental_content=[
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,AAAA"
+                                },
+                            }
+                        ],
+                    )
+                },
+            )
+            self.assertEqual(script.thread_count, 2)
+            self.assertEqual(script.turn_count, 2)
+            self.assertEqual(
+                script.dynamic_reply["contentItems"],
+                [{"type": "inputText", "text": '{"molecule": "CC"}'}],
+            )
+            self.assertEqual(script.turn_inputs[-1], [])
+            injected = script.injected_histories[-1]
+            self.assertEqual(injected[0]["type"], "message")
+            self.assertEqual(injected[0]["role"], "user")
+            self.assertEqual(
+                injected[0]["content"],
+                [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AAAA",
+                    }
+                ],
+            )
+            self.assertEqual(injected[1]["type"], "function_call")
+            self.assertEqual(injected[1]["call_id"], "call-1")
+            self.assertEqual(injected[2]["type"], "function_call_output")
+            self.assertEqual(injected[2]["call_id"], "call-1")
+            self.assertEqual(injected[2]["output"], '{"molecule": "CC"}')
+            self.assertEqual(
+                backend.runtime_metadata()["resolved_models"],
+                ["available-model"],
+            )
+        finally:
+            backend.close()
+
+    def test_existing_tool_history_is_injected_with_native_response_roles(self):
+        backend, script = self.make_backend()
+        try:
+            response = backend.generate(
+                LLMRequest(
+                    messages=[
+                        {"role": "system", "content": "Return chemistry JSON."},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Read figure"},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": "data:image/png;base64,AAAA"
+                                    },
+                                },
+                            ],
+                        },
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "agent-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "reaction_agent",
+                                        "arguments": '{"image_path":"figure.png"}',
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "agent-1",
+                            "name": "reaction_agent",
+                            "content": '{"reactants":["CC"]}',
+                        },
+                    ],
+                    json_mode=True,
+                )
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertEqual(script.turn_input, [])
+            self.assertEqual(
+                [item["type"] for item in script.injected_histories[0]],
+                ["message", "function_call", "function_call_output"],
+            )
+            self.assertEqual(
+                script.injected_histories[0][0]["content"][1],
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,AAAA",
+                },
+            )
+        finally:
+            backend.close()
+
+    def test_overload_retry_timeout_eof_rate_limit_and_cancel(self):
+        backend, script = self.make_backend(
+            max_retries=2,
+            overload_method="model/list",
+        )
+        try:
+            with mock.patch("chemeagle_llm.codex_app_server.time.sleep"):
+                self.assertEqual(backend.models()[0]["id"], "available-model")
+            self.assertEqual(script.overload_count, 1)
+        finally:
+            backend.close()
+
+        backend, _ = self.make_backend(ignore_method="model/list")
+        try:
+            with self.assertRaises(BackendTimeoutError):
+                backend.client.request("model/list", {}, timeout=0.01)
+        finally:
+            backend.close()
+
+        backend, _ = self.make_backend(close_method="model/list")
+        try:
+            with self.assertRaises(BackendProcessError):
+                backend.models()
+        finally:
+            backend.close()
+
+        backend, _ = self.make_backend(rate_limited=True)
+        try:
+            with self.assertRaises(BackendRateLimitError):
+                backend.generate(LLMRequest(messages=[{"role": "user", "content": "x"}]))
+        finally:
+            backend.close()
+
+        backend, script = self.make_backend(hold_turn=True)
+        cancel_event = threading.Event()
+        timer = threading.Timer(0.03, cancel_event.set)
+        timer.start()
+        try:
+            with self.assertRaises(BackendCancelledError):
+                backend.generate(
+                    LLMRequest(
+                        messages=[{"role": "user", "content": "wait"}],
+                        cancel_event=cancel_event,
+                    )
+                )
+            self.assertEqual(script.interrupts[0]["turnId"], "turn-1")
+        finally:
+            timer.cancel()
+            backend.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
