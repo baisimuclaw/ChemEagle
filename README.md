@@ -73,6 +73,7 @@ conda activate chemeagle
 
 2. Then install requirements:
 ```bash
+conda install -c conda-forge poppler
 pip install -r requirements.txt
 ```
 
@@ -158,6 +159,7 @@ Depending on the model size and architecture (Dense vs. MoE), the VRAM requireme
 ```bash
 conda create -n chemeagle python=3.10
 conda activate chemeagle
+conda install -c conda-forge poppler
 pip install -r requirements.txt
 ```
 
@@ -347,5 +349,4 @@ The input can be any chemical graphics; feel free to try more examples!
 ## :warning: Acknowledgement
 1. We use api_version="2024-10-21" with the HKUST Azure OpenAI endpoint as our official closed-source version.
 2. Our code is based on [MolNexTR](https://github.com/CYF2000127/MolNexTR), [MolScribe](https://github.com/thomas0809/MolScribe), [RxnIM](https://github.com/CYF2000127/RxnIM), [RxnScribe](https://github.com/thomas0809/RxNScribe), [ChemNER](https://github.com/Ozymandias314/ChemIENER), [ChemRxnExtractor](https://github.com/jiangfeng1124/ChemRxnExtractor), [AutoAgents](https://github.com/Link-AGI/AutoAgents), and [Azure OpenAI](https://azure.microsoft.com/).
-
 

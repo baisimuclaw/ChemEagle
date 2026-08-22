@@ -25,5 +25,6 @@ pdfminer
 pdf2image
 pytesseract
 safetensors
+einops==0.8.1
 chemrxnextractor @ git+https://github.com/CrystalEye42/ChemRxnExtractor.git@0f9529dbe3656e4ef5ea96c5b5ba990f7481700b
 py2opsin
