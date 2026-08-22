@@ -1,4 +1,5 @@
 import os
+import torch
 from pdf2image import convert_from_path
 from transformers import AutoProcessor, AutoModelForCausalLM 
 from safetensors.torch import load_file
@@ -15,6 +16,20 @@ BASE_MODEL_ID = "shixuanleong/visualheist-base"
 LARGE_SAFETENSORS_PATH = "https://huggingface.co/shixuanleong/visualheist-large/resolve/main/model.safetensors" 
 BASE_SAFETENSORS_PATH = "https://huggingface.co/shixuanleong/visualheist-base/resolve/main/model.safetensors" 
 
+
+def _resolve_device(device):
+    """Resolve a VisualHeist inference device without silently changing it."""
+    requested = str(device or "cpu").strip().lower()
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    resolved = torch.device(requested)
+    if resolved.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"VisualHeist was configured for {requested}, but CUDA is unavailable"
+        )
+    return resolved
+
 def _pdf_to_image(pdf_path):
     """Converts a pdf into a list of images
     :param pdf_path: Path to pdf
@@ -27,7 +42,7 @@ def _pdf_to_image(pdf_path):
     return images
 
 
-def _tf_id_detection(image, model, processor):
+def _tf_id_detection(image, model, processor, device="cpu"):
     
     """Performs table and figure identification using model and processor on image
 
@@ -37,20 +52,27 @@ def _tf_id_detection(image, model, processor):
     :type model: AutoModelForCausalLM
     :param processor: The processor that tokenizes input text for the model
     :type processor: AutoProcessor
+    :param device: Torch inference device (``cpu``, ``cuda``, or ``auto``)
 
     :return: Dictionary of annotations done on image
     :rtype: dict
     """
     prompt = "<OD>"
+    resolved_device = _resolve_device(device)
     inputs = processor(text=prompt, images=image, return_tensors="pt")
+    inputs = {
+        name: value.to(resolved_device) if hasattr(value, "to") else value
+        for name, value in inputs.items()
+    }
 
-    generated_ids = model.generate(
-        input_ids=inputs["input_ids"],
-        pixel_values=inputs["pixel_values"],
-        max_new_tokens=1024,
-        do_sample=False,
-        num_beams=3
-    )
+    with torch.inference_mode():
+        generated_ids = model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=1024,
+            do_sample=False,
+            num_beams=3
+        )
 
     generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
     annotation = processor.post_process_generation(
@@ -74,7 +96,7 @@ def _save_image_from_bbox(image, annotation, image_counter, output_dir, pdf_name
     return len(annotation["bboxes"]) + image_counter
 
 
-def _create_model(model_id, base_or_large):
+def _create_model(model_id, base_or_large, device="cpu"):
     
     """Intializes model used for segmenting tables and figures using either the base or large model
 
@@ -82,6 +104,7 @@ def _create_model(model_id, base_or_large):
     :type model_id: str
     :param base_or_large: String is either 'base' or 'large' depending on whether we use base or large model
     :type base_or_large: str
+    :param device: Torch inference device (``cpu``, ``cuda``, or ``auto``)
     
     :return: Returns the model and processor that allows for 
     :rtype: tuple[AutoModelForCausalLM, AutoProcessor]
@@ -94,12 +117,15 @@ def _create_model(model_id, base_or_large):
         safetensors_download_path = hf_hub_download(repo_id=model_id, filename="model.safetensors")
 
     state_dict = load_file(safetensors_download_path)
+    resolved_device = _resolve_device(device)
     model = AutoModelForCausalLM.from_pretrained(model_id, state_dict=state_dict, trust_remote_code=True)
+    model = model.to(resolved_device)
+    model.eval()
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
     return model, processor
 
 
-def _pdf_to_figures_and_tables(pdf_path, output_dir, large_model):
+def _pdf_to_figures_and_tables(pdf_path, output_dir, large_model, device="cpu"):
     
     """Takes a singke pdf and runs either LARGE_MODEL_ID or BASE_MODEL_ID on it to extract tables and figures.
     Saves the results in output_dir
@@ -110,6 +136,7 @@ def _pdf_to_figures_and_tables(pdf_path, output_dir, large_model):
     :type output_dir: str
     :param large_model: Whether we use the large or base model when performing table-figure extraction
     :type large_model: bool
+    :param device: Torch inference device (``cpu``, ``cuda``, or ``auto``)
     
     :return: Returns nothing, all segmented figures and tables are saved seperatly
     :rtype: None
@@ -120,10 +147,21 @@ def _pdf_to_figures_and_tables(pdf_path, output_dir, large_model):
     images = _pdf_to_image(pdf_path)
     print(f"PDF {pdf_name} is loaded.")  
     
+    resolved_device = _resolve_device(device)
+    print(f"VisualHeist inference device: {resolved_device}")
+
     if large_model:
-        model, processor = _create_model(LARGE_MODEL_ID, "large")
+        model, processor = _create_model(
+            LARGE_MODEL_ID,
+            "large",
+            device=resolved_device,
+        )
     else:
-        model, processor = _create_model(BASE_MODEL_ID, "base")    
+        model, processor = _create_model(
+            BASE_MODEL_ID,
+            "base",
+            device=resolved_device,
+        )
     
     image_counter = 0
     # for i, image in enumerate(images):
@@ -132,14 +170,24 @@ def _pdf_to_figures_and_tables(pdf_path, output_dir, large_model):
     #     print(f"Page {i} saved. Number of objects: {len(annotation['bboxes'])}")
     
     for i, image in enumerate(images):
-        annotation = _tf_id_detection(image, model, processor)
+        annotation = _tf_id_detection(
+            image,
+            model,
+            processor,
+            device=resolved_device,
+        )
         image_counter = _save_image_from_bbox(image, annotation, image_counter, output_dir, pdf_name, page_number=i + 1)
         print(f"Page {i + 1} saved. Number of objects: {len(annotation['bboxes'])}")
     print(f"All extracted images from {pdf_name} are saved")
     print("=====================================")
 
 
-def batch_pdf_to_figures_and_tables(input_dir, output_dir=None, large_model=False):
+def batch_pdf_to_figures_and_tables(
+    input_dir,
+    output_dir=None,
+    large_model=False,
+    device="cpu",
+):
     """Takes a directory of pdfs via input_dir and saves tables and figures in output_dir
     
     :param input_dir: Input directory to pdfs
@@ -148,6 +196,7 @@ def batch_pdf_to_figures_and_tables(input_dir, output_dir=None, large_model=Fals
     :type output_dir: str
     :param large_model: Whether we use the large or base model when performing table-figure extraction, defaults to False
     :type large_model: bool
+    :param device: Torch inference device (``cpu``, ``cuda``, or ``auto``)
     
     :return: None, all files will be saved in output_dir
     :rtype: None
@@ -162,7 +211,12 @@ def batch_pdf_to_figures_and_tables(input_dir, output_dir=None, large_model=Fals
             continue
         pdf_path = os.path.join(input_dir,file)
         try:
-            _pdf_to_figures_and_tables(pdf_path, output_dir, large_model)
+            _pdf_to_figures_and_tables(
+                pdf_path,
+                output_dir,
+                large_model,
+                device=device,
+            )
         except Exception as e:
             print(e)
             print(f"pdf {pdf_path} cannot be processed.") 

@@ -17,8 +17,14 @@ def load_config(config_file):
     return config
 
 
-def run_pdf(config_file=None, pdf_dir=None, image_dir=None, model_size= "large"):
-    """Main function to run VisualHeist processing"""
+def run_pdf(
+    config_file=None,
+    pdf_dir=None,
+    image_dir=None,
+    model_size="large",
+    device=None,
+):
+    """Run VisualHeist on ``device``; CPU remains the default."""
     if config_file:
         config = load_config(config_file)
     else:
@@ -28,7 +34,13 @@ def run_pdf(config_file=None, pdf_dir=None, image_dir=None, model_size= "large")
     
     image_dir = image_dir or config.get('image_dir', config.get('default_image_dir'))
     model_size = model_size or config.get('model_size', "base")
+    device = device or config.get('device', 'cpu')
     
     print(f"\nProcessing the PDF: {pdf_dir}")
     print(f"Using {'LARGE' if model_size == 'large' else 'BASE'} model")
-    _pdf_to_figures_and_tables(pdf_dir, image_dir, large_model=(model_size == "large"))
+    _pdf_to_figures_and_tables(
+        pdf_dir,
+        image_dir,
+        large_model=(model_size == "large"),
+        device=device,
+    )
