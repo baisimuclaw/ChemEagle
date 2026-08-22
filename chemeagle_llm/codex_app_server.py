@@ -43,7 +43,7 @@ from .errors import (
     ToolExecutionError,
     UnsupportedCapabilityError,
 )
-from .types import LLMRequest, LLMResponse
+from .types import LLMRequest, LLMResponse, LLMToolOutput
 
 logger = logging.getLogger(__name__)
 
@@ -443,12 +443,23 @@ class CodexAppServerClient:
         _trace(f"tool/start name={tool_name}")
         try:
             result = handler(**arguments)
+            supplemental_content = []
+            if isinstance(result, LLMToolOutput):
+                supplemental_content = result.supplemental_content
+                result = result.value
             text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
             _trace(
                 f"tool/complete name={tool_name} elapsed={time.monotonic() - started_at:.3f}s "
                 f"payload_chars={len(text)}"
             )
-            self._send_result(request_id, tool_result(text, success=True))
+            self._send_result(
+                request_id,
+                tool_result(
+                    text,
+                    success=True,
+                    supplemental_content=supplemental_content,
+                ),
+            )
             _trace(f"tool/result-sent name={tool_name} success=true")
         except Exception as exc:
             _trace(
@@ -665,6 +676,24 @@ class CodexAppServerBackend(BaseLLMBackend):
     ):
         self.config = config
         self.client = client or CodexAppServerClient(config)
+        self._resolved_models: List[str] = []
+        self._resolved_models_lock = threading.Lock()
+
+    def _record_resolved_model(self, model: Optional[str]) -> None:
+        if not model:
+            return
+        with self._resolved_models_lock:
+            if model not in self._resolved_models:
+                self._resolved_models.append(model)
+
+    def runtime_metadata(self) -> Dict[str, Any]:
+        with self._resolved_models_lock:
+            resolved = list(self._resolved_models)
+        return {
+            "provider": self.provider_name,
+            "configured_model": self.config.model,
+            "resolved_models": resolved,
+        }
 
     def _require_subscription(self) -> Dict[str, Any]:
         account = self.client.account(refresh=False)
@@ -814,16 +843,25 @@ class CodexAppServerBackend(BaseLLMBackend):
             thread_params["dynamicTools"] = openai_tools_to_dynamic(tools)
 
         with self.client.tool_executor(executor):
-            started = self.client.request("thread/start", thread_params)
-            thread = started.get("thread") or {}
-            thread_id = thread.get("id")
-            if not thread_id:
-                raise BackendProcessError("Codex thread/start returned no thread id")
-            _trace(
-                f"thread/start id={thread_id} model="
-                f"{started.get('model') or selected_model or 'default'}"
-            )
+            def start_thread() -> Tuple[Dict[str, Any], str, Optional[str]]:
+                started_thread = self.client.request("thread/start", thread_params)
+                thread = started_thread.get("thread") or {}
+                new_thread_id = thread.get("id")
+                if not new_thread_id:
+                    raise BackendProcessError(
+                        "Codex thread/start returned no thread id"
+                    )
+                model = started_thread.get("model") or selected_model
+                self._record_resolved_model(model)
+                _trace(
+                    f"thread/start id={new_thread_id} model={model or 'default'}"
+                )
+                return started_thread, str(new_thread_id), model
+
+            started, thread_id, resolved_model = start_thread()
             output_schema = request.output_schema
+            if output_schema is None and request.json_mode:
+                output_schema = {"type": "object"}
             attempts = max(1, min(self.config.max_retries, 3))
             correction_retry = False
             for attempt in range(attempts):
@@ -879,6 +917,11 @@ class CodexAppServerBackend(BaseLLMBackend):
                             attempt + 2,
                             attempts,
                         )
+                        # Interrupted turns remain in Codex conversation history.
+                        # A fresh ephemeral thread makes this a genuinely
+                        # independent retry while the outer tool-call cache
+                        # still avoids duplicate GPU inference.
+                        started, thread_id, resolved_model = start_thread()
                         continue
                     raise
                 except Exception as exc:
@@ -917,12 +960,12 @@ class CodexAppServerBackend(BaseLLMBackend):
                     raise InvalidResponseError("Codex completed without an agent message")
                 response = LLMResponse(
                     content=agent_messages[-1],
-                    model=started.get("model") or selected_model,
+                    model=resolved_model,
                     metadata={"thread_id": thread_id, "turn_id": turn.get("id")},
                 )
                 if request.json_mode or request.output_schema:
                     try:
-                        parse_json_content(response, request.output_schema)
+                        parse_json_content(response, output_schema)
                     except InvalidResponseError:
                         if attempt + 1 < attempts:
                             logger.warning(

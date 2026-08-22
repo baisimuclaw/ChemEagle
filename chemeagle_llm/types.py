@@ -52,6 +52,20 @@ class LLMResponse:
 
 
 @dataclass
+class LLMToolOutput:
+    """A tool value plus multimodal evidence for the model's continuation.
+
+    ``value`` remains the machine-readable function result.  Supplemental
+    content is delivered after the tool result (or as Codex dynamic-tool
+    content items), so agents can inspect an annotated image without rerunning
+    the underlying vision model.
+    """
+
+    value: Any
+    supplemental_content: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class LLMRequest:
     messages: List[Dict[str, Any]]
     model: Optional[str] = None

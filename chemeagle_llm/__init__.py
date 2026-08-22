@@ -22,7 +22,7 @@ from .errors import (
     UnsupportedCapabilityError,
 )
 from .factory import create_backend
-from .types import LLMRequest, LLMResponse, LLMToolCall
+from .types import LLMRequest, LLMResponse, LLMToolCall, LLMToolOutput
 
 __all__ = [
     "AuthenticationError",
@@ -39,6 +39,7 @@ __all__ = [
     "LLMRequest",
     "LLMResponse",
     "LLMToolCall",
+    "LLMToolOutput",
     "ToolExecutionError",
     "UnsupportedCapabilityError",
     "backend_scope",

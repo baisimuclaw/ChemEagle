@@ -29,6 +29,7 @@ import threading
 from contextvars import copy_context
 from chemeagle_llm import (
     LLMRequest,
+    LLMToolOutput,
     backend_model,
     backend_scope,
     get_active_backend,
@@ -221,16 +222,20 @@ def _run_image_tool_agent_with_results(
     tools,
     model_name,
     handlers,
+    *,
+    supplemental_content_factory=None,
 ):
     """Run only model-selected, strictly whitelisted image tools and record results."""
     cache = {}
     result_messages = []
     result_lock = threading.Lock()
+    supplemental_sent = False
 
     def bind(name, handler):
         caller_context = copy_context()
 
         def invoke(**_arguments):
+            nonlocal supplemental_sent
             # Ignore the model-provided path. Nested LLM agents inherit exactly
             # the current backend via the request scope.
             def run_handler():
@@ -251,6 +256,17 @@ def _run_image_tool_agent_with_results(
             with result_lock:
                 cache[name] = value
                 result_messages.append(message)
+                attach_supplement = (
+                    supplemental_content_factory is not None
+                    and not supplemental_sent
+                )
+                if attach_supplement:
+                    supplemental_sent = True
+            if attach_supplement:
+                return LLMToolOutput(
+                    value=llm_value,
+                    supplemental_content=supplemental_content_factory(),
+                )
             return llm_value
 
         return invoke
@@ -1144,6 +1160,50 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
         }
     ]
 
+    annotated_content_lock = threading.Lock()
+    annotated_content_cache = None
+
+    def annotated_molecule_content():
+        nonlocal annotated_content_cache
+        with annotated_content_lock:
+            if annotated_content_cache is None:
+                cached_coref = get_cached_multi_molecular(image_path)
+                annotated_img = draw_mol_bboxes(
+                    image_path,
+                    cached_coref,
+                    output_path=None,
+                )
+                if annotated_img is None:
+                    raise RuntimeError(
+                        "Could not create the molecule-bounding-box review image"
+                    )
+                annotated_content_cache = [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Use this annotated copy of the original figure to align "
+                            "molecule bounding-box IDs, labels, and R-group assignments."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": (
+                                "data:image/png;base64,"
+                                f"{encode_image_from_array(annotated_img)}"
+                            )
+                        },
+                    },
+                ]
+            return copy.deepcopy(annotated_content_cache)
+
+    # Upstream always creates this review image between tool selection and the
+    # final answer.  Build it once from the request cache before entering the
+    # dynamic-tool turn, then attach the same lossless PNG to the first tool
+    # result.  This also makes annotation failures explicit instead of letting
+    # Codex continue after a failed dynamic tool callback.
+    annotated_content = annotated_molecule_content()
+
     gpt_output, results, _tool_cache = _run_image_tool_agent_with_results(
         backend,
         image_path,
@@ -1155,7 +1215,32 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
             "get_reaction": get_reaction,
             "get_reaction_con": get_reaction_con,
         },
+        supplemental_content_factory=lambda: copy.deepcopy(annotated_content),
     )
+    if not results:
+        # ``tool_choice=auto`` may legitimately return no call.  The official
+        # implementation still performs a second annotated-image pass in that
+        # case, so preserve that behavior rather than accepting an answer that
+        # never saw the molecule IDs.
+        with backend_scope(backend):
+            review_response = backend.generate(
+                LLMRequest(
+                    model=backend_model(backend, "gpt-5-mini"),
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                *copy.deepcopy(annotated_content),
+                            ],
+                        },
+                    ],
+                    json_mode=True,
+                    temperature=0,
+                )
+            )
+        gpt_output = parse_json_content(review_response)
     print("R_group_agent_output:", gpt_output)
     gpt_output = _compensate_missing_molecules(gpt_output, results, 'get_multi_molecular_text_to_correct')
     image = Image.open(image_path).convert('RGB')

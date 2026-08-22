@@ -220,6 +220,7 @@ def run_image(
         "finished_at": None,
         "elapsed_seconds": None,
         "vision_health": None,
+        "llm_backend": None,
         "result": None,
     }
     llm = None
@@ -265,6 +266,10 @@ def run_image(
                     flush=True,
                 )
             finally:
+                if llm is not None:
+                    runtime_metadata = getattr(llm, "runtime_metadata", None)
+                    if callable(runtime_metadata):
+                        report["llm_backend"] = runtime_metadata()
                 if vision is not None:
                     vision.close()
                 if llm is not None:

@@ -22,7 +22,7 @@ from chemeagle_llm.errors import (
     BackendTimeoutError,
     UnsupportedCapabilityError,
 )
-from chemeagle_llm.types import LLMRequest
+from chemeagle_llm.types import LLMRequest, LLMToolOutput
 
 
 class _QueueStream:
@@ -99,6 +99,7 @@ class _CodexScript:
         self.ignore_method = ignore_method
         self.overload_count = 0
         self.turn_count = 0
+        self.thread_count = 0
         self.initialized_received = False
         self.login_types = []
         self.interrupts = []
@@ -217,6 +218,7 @@ class _CodexScript:
                 },
             )
         elif method == "thread/start":
+            self.thread_count += 1
             self.dynamic_tools = message["params"].get("dynamicTools") or []
             self.response(
                 message,
@@ -431,10 +433,7 @@ class CodexBackendTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(response.content), {"reactions": []})
             self.assertEqual(script.dynamic_reply["success"], True)
-            self.assertIsNone(
-                script.output_schema,
-                "generic json_mode must rely on local JSON validation",
-            )
+            self.assertEqual(script.output_schema, {"type": "object"})
             tool_payload = json.loads(script.dynamic_reply["contentItems"][0]["text"])
             self.assertEqual(tool_payload, {"doubled": 6})
         finally:
@@ -537,6 +536,7 @@ class CodexBackendTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(response.content), {"reactions": []})
             self.assertEqual(script.turn_count, 3)
+            self.assertEqual(script.thread_count, 3)
             self.assertEqual(len(script.interrupts), 2)
             self.assertTrue(
                 all(value == script.turn_inputs[0] for value in script.turn_inputs)
@@ -556,6 +556,7 @@ class CodexBackendTests(unittest.TestCase):
                     LLMRequest(messages=[{"role": "user", "content": "never"}])
                 )
             self.assertEqual(script.turn_count, 3)
+            self.assertEqual(script.thread_count, 3)
             self.assertEqual(len(script.interrupts), 3)
         finally:
             backend.close()
@@ -588,6 +589,7 @@ class CodexBackendTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(response.content), {"reactions": []})
             self.assertEqual(script.turn_count, 2)
+            self.assertEqual(script.thread_count, 2)
             self.assertEqual(len(script.interrupts), 1)
             handler.assert_called_once_with(value=3)
         finally:
@@ -679,7 +681,58 @@ class CodexBackendTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(response.content), {"reactions": []})
             self.assertEqual(script.turn_count, 2)
-            self.assertIsNone(script.output_schema)
+            self.assertEqual(script.output_schema, {"type": "object"})
+        finally:
+            backend.close()
+
+    def test_dynamic_tool_can_return_annotated_image_evidence(self):
+        backend, script = self.make_backend()
+        try:
+            backend.run_tool_loop(
+                LLMRequest(
+                    messages=[{"role": "user", "content": "Use lookup"}],
+                    json_mode=True,
+                ),
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                executor={
+                    "lookup": lambda **_kwargs: LLMToolOutput(
+                        value={"molecule": "CC"},
+                        supplemental_content=[
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,AAAA"
+                                },
+                            }
+                        ],
+                    )
+                },
+            )
+            self.assertEqual(
+                script.dynamic_reply["contentItems"],
+                [
+                    {
+                        "type": "inputText",
+                        "text": '{"molecule": "CC"}',
+                    },
+                    {
+                        "type": "inputImage",
+                        "imageUrl": "data:image/png;base64,AAAA",
+                    },
+                ],
+            )
+            self.assertEqual(
+                backend.runtime_metadata()["resolved_models"],
+                ["available-model"],
+            )
         finally:
             backend.close()
 

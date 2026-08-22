@@ -449,7 +449,11 @@ class ImportAndOrchestrationTests(unittest.TestCase):
             mock.patch.object(
                 get_R_group_sub_agent,
                 "_run_image_tool_agent_with_results",
-                return_value=(agent_output, [], {}),
+                return_value=(
+                    agent_output,
+                    [{"role": "tool", "content": "{}"}],
+                    {},
+                ),
             ),
             mock.patch.object(
                 get_R_group_sub_agent,
@@ -465,6 +469,13 @@ class ImportAndOrchestrationTests(unittest.TestCase):
                 get_R_group_sub_agent,
                 "get_cached_raw_results",
                 return_value=[],
+            ),
+            mock.patch.object(
+                get_R_group_sub_agent,
+                "draw_mol_bboxes",
+                return_value=get_R_group_sub_agent.np.zeros(
+                    (2, 2, 3), dtype=get_R_group_sub_agent.np.uint8
+                ),
             ),
             mock.patch.object(get_R_group_sub_agent.Image, "open") as open_image,
             mock.patch.object(

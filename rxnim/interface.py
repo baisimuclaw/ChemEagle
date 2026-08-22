@@ -17,6 +17,8 @@ from molnextr import MolNexTR
 from huggingface_hub import hf_hub_download
 import easyocr
 
+from chemeagle_vision.checkpoints import load_model_checkpoint
+
 
 class RxnIM:
 
@@ -79,11 +81,8 @@ class RxnIM:
         return args
 
     def get_model(self, args, tokenizer, device, model_states):
-        def remove_prefix(state_dict):
-            return {k.replace('model.', ''): v for k, v in state_dict.items()}
-
         model = build_pix2seq_model(args, tokenizer[args.format])
-        model.load_state_dict(remove_prefix(model_states), strict=False)
+        load_model_checkpoint(model, model_states, component="RxnIM")
         model.to(device)
         model.eval()
         return model
@@ -249,11 +248,8 @@ class MolDetect:
     
     
     def get_model(self, args, tokenizer, device, model_states):
-        def remove_prefix(state_dict):
-            return {k.replace('model.', ''): v for k, v in state_dict.items()}
-
         model = build_pix2seq_model(args, tokenizer[args.format])
-        model.load_state_dict(remove_prefix(model_states), strict=False)
+        load_model_checkpoint(model, model_states, component="MolDetect")
         model.to(device)
         model.eval()
         return model

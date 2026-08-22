@@ -9,7 +9,7 @@ from dataclasses import replace
 from typing import Any, Callable, Dict, Mapping, Protocol, runtime_checkable
 
 from .errors import InvalidResponseError, ToolExecutionError, UnsupportedCapabilityError
-from .types import LLMRequest, LLMResponse
+from .types import LLMRequest, LLMResponse, LLMToolOutput
 
 
 def validate_json_value(value: Any, schema: Dict[str, Any]) -> None:
@@ -178,6 +178,7 @@ class BaseLLMBackend(ABC):
         schemas = tool_input_schemas(tools)
         messages = list(request.messages)
         messages.append(first.assistant_message())
+        supplemental_content = []
         for call in first.tool_calls:
             handler = executor.get(call.name)
             if handler is None:
@@ -188,6 +189,9 @@ class BaseLLMBackend(ABC):
                 if schema is not None:
                     validate_json_value(arguments, schema)
                 result = handler(**arguments)
+                if isinstance(result, LLMToolOutput):
+                    supplemental_content.extend(result.supplemental_content)
+                    result = result.value
             except Exception as exc:
                 raise ToolExecutionError(f"Tool {call.name!r} failed: {exc}") from exc
             messages.append(
@@ -198,6 +202,8 @@ class BaseLLMBackend(ABC):
                     "content": json.dumps(result, ensure_ascii=False),
                 }
             )
+        if supplemental_content:
+            messages.append({"role": "user", "content": supplemental_content})
         return self.generate(
             replace(request, messages=messages, tools=[], tool_choice=None)
         )
