@@ -233,6 +233,53 @@ logs are written under `logs/`, remote worker stderr uses `*.remote.log`, and fi
 structured results use `results/*.json`. Set `CHEMEAGLE_VISION_REMOTE_LOG` when using
 the backend outside this runner to persist remote stderr locally.
 
+For a real PDF-input workflow, use the separate PDF batch runner. Its manifest uses
+`pdf`, not `image`, so the source document is consumed by the upstream
+`pdf_extraction.run_pdf` implementation before any ChemEAGLE image job starts:
+
+```json
+{
+  "items": [
+    {"id": "paper-1", "pdf": "papers/paper-1.pdf"},
+    {"id": "paper-2", "pdf": "papers/paper-2.pdf"}
+  ]
+}
+```
+
+First run a zero-Codex, zero-remote-GPU extraction preflight. This downloads or
+loads the VisualHeist PDF model, renders every page, saves every detected
+figure/table, and records the exact task count:
+
+```bash
+python scripts/run_pdf_batch.py \
+  --manifest /LOCAL/PATH/pdf-manifest.json \
+  --run-dir /LOCAL/PATH/pdf-run \
+  --model-size large \
+  --max-parallel 1 \
+  --extract-only
+```
+
+After reviewing `extract_status.json` and `extraction/*.json`, start the full
+workflow in the same run directory. The verified crops are reused without running
+PDF extraction again:
+
+```bash
+python scripts/run_pdf_batch.py \
+  --manifest /LOCAL/PATH/pdf-manifest.json \
+  --run-dir /LOCAL/PATH/pdf-run \
+  --model-size large \
+  --max-parallel 2
+```
+
+`results/<paper-id>/*.json` and `logs/<paper-id>/*.log` are written after every
+individual crop, so an interrupted PDF resumes at the next unfinished image. One
+independent Slurm worker is allocated per crop and writes stderr to
+`logs/<paper-id>/<image-id>.remote.log`; this keeps the configured Slurm time limit
+per image rather than sharing it across every image in a long PDF.
+`paper_results/<paper-id>.json` summarizes figure-level success and failure, while
+`full_status.json` tracks the five-paper scheduler. A PDF is not reported as
+successful if any extracted image failed.
+
 Codex uses a four-minute ordinary response window. The final Data Structure Agent
 uses the upstream-compatible ten-minute window because it receives the complete
 original image, prompt, and agent results. Both retry the identical request at most
