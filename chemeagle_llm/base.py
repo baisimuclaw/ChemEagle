@@ -173,11 +173,33 @@ class BaseLLMBackend(ABC):
     ) -> LLMResponse:
         first = self.generate(replace(request, tools=list(tools)))
         if not first.tool_calls:
+            if request.tool_followup_content:
+                messages = [
+                    message
+                    for message in request.messages
+                    if message.get("role") in {"system", "developer"}
+                ]
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": request.tool_followup_content,
+                    }
+                )
+                messages.append(first.assistant_message())
+                return self.generate(
+                    replace(
+                        request,
+                        messages=messages,
+                        tools=[],
+                        tool_choice=None,
+                        tool_followup_content=[],
+                    )
+                )
             return first
 
         schemas = tool_input_schemas(tools)
-        messages = list(request.messages)
-        messages.append(first.assistant_message())
+        assistant_message = first.assistant_message()
+        tool_messages = []
         supplemental_content = []
         for call in first.tool_calls:
             handler = executor.get(call.name)
@@ -194,7 +216,7 @@ class BaseLLMBackend(ABC):
                     result = result.value
             except Exception as exc:
                 raise ToolExecutionError(f"Tool {call.name!r} failed: {exc}") from exc
-            messages.append(
+            tool_messages.append(
                 {
                     "role": "tool",
                     "name": call.name,
@@ -203,9 +225,27 @@ class BaseLLMBackend(ABC):
                 }
             )
         if supplemental_content:
+            # Match the upstream two-completion contract: the second request
+            # replaces the original figure with its annotated copy, followed
+            # by the assistant function calls and their tool outputs.
+            messages = [
+                message
+                for message in request.messages
+                if message.get("role") in {"system", "developer"}
+            ]
             messages.append({"role": "user", "content": supplemental_content})
+        else:
+            messages = list(request.messages)
+        messages.append(assistant_message)
+        messages.extend(tool_messages)
         return self.generate(
-            replace(request, messages=messages, tools=[], tool_choice=None)
+            replace(
+                request,
+                messages=messages,
+                tools=[],
+                tool_choice=None,
+                tool_followup_content=[],
+            )
         )
 
     def parse_json(self, response: LLMResponse, schema: Dict[str, Any] | None = None) -> Any:

@@ -15,7 +15,7 @@ from chemeagle_llm.errors import (
     ToolExecutionError,
 )
 from chemeagle_llm.factory import create_backend
-from chemeagle_llm.types import LLMRequest, LLMResponse
+from chemeagle_llm.types import LLMRequest, LLMResponse, LLMToolOutput
 
 
 class _FakeCompletions:
@@ -210,6 +210,106 @@ class OpenAICompatibleContractTests(unittest.TestCase):
         followup = client.chat.completions.calls[1]["messages"]
         self.assertEqual(followup[-1]["role"], "tool")
         self.assertEqual(json.loads(followup[-1]["content"]), {"answer": 8})
+
+    def test_supplemental_image_replaces_first_user_image_in_upstream_order(self):
+        client = _FakeClient(
+            [
+                _response(tool_calls=[_tool_call("lookup", {"value": 4})]),
+                _response('{"answer": 8}'),
+            ]
+        )
+        backend = create_backend(
+            config=BackendConfig(
+                provider="local",
+                model="qwen",
+                base_url="http://localhost:8000/v1",
+                max_retries=1,
+            ),
+            client=client,
+        )
+        backend.run_tool_loop(
+            LLMRequest(
+                messages=[
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "original image"},
+                ],
+                json_mode=True,
+            ),
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            executor={
+                "lookup": lambda **_kwargs: LLMToolOutput(
+                    value={"answer": 8},
+                    supplemental_content=[
+                        {"type": "text", "text": "same prompt"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64,ANNOTATED"
+                            },
+                        },
+                    ],
+                )
+            },
+        )
+        followup = client.chat.completions.calls[1]["messages"]
+        self.assertEqual(
+            [message["role"] for message in followup],
+            ["system", "user", "assistant", "tool"],
+        )
+        self.assertEqual(followup[1]["content"][0]["text"], "same prompt")
+        self.assertNotIn("original image", json.dumps(followup))
+
+    def test_no_tool_call_still_runs_upstream_second_completion(self):
+        client = _FakeClient(
+            [
+                _response('{"preliminary": true}'),
+                _response('{"answer": 8}'),
+            ]
+        )
+        backend = create_backend(
+            config=BackendConfig(
+                provider="local",
+                model="qwen",
+                base_url="http://localhost:8000/v1",
+                max_retries=1,
+            ),
+            client=client,
+        )
+        result = backend.run_tool_loop(
+            LLMRequest(
+                messages=[
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "original image"},
+                ],
+                json_mode=True,
+                tool_followup_content=[
+                    {"type": "text", "text": "same prompt"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,ANNOTATED"
+                        },
+                    },
+                ],
+            ),
+            tools=[],
+            executor={},
+        )
+        self.assertEqual(parse_json_content(result), {"answer": 8})
+        followup = client.chat.completions.calls[1]["messages"]
+        self.assertEqual(
+            [message["role"] for message in followup],
+            ["system", "user", "assistant"],
+        )
+        self.assertNotIn("original image", json.dumps(followup))
 
     def test_invalid_json_is_not_silently_accepted(self):
         client = _FakeClient([_response("not json")])

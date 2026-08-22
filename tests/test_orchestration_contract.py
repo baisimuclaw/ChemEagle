@@ -125,6 +125,27 @@ class ImportAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(predict.call_count, 3)
         self.assertEqual(cache["raw_prediction"], [])
 
+    def test_reaction_agents_never_replace_empty_rxnim_with_llm_guess(self):
+        source = (ROOT / "get_reaction_agent.py").read_text(encoding="utf-8")
+        functions = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef)
+        }
+        for name in (
+            "get_reaction_withatoms",
+            "get_reaction_withatoms_correctR",
+            "get_reaction_withatoms_correctR_OS",
+        ):
+            with self.subTest(name=name):
+                function_source = functions[name]
+                self.assertIn("if not input2", function_source)
+                self.assertIn("return []", function_source)
+                self.assertNotIn(
+                    "input2[0] if input2 else gpt_output",
+                    function_source,
+                )
+
     def test_reaction_prediction_does_not_hide_inference_errors(self):
         with mock.patch.object(
             get_reaction_agent.model1,
@@ -376,8 +397,22 @@ class ImportAndOrchestrationTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
             and node.name == "_run_image_tool_agent_with_results"
         )
-        self.assertIn("llm_value = value", nested_function)
+        self.assertIn(
+            'llm_value = {"image_path": image_path, name: value}',
+            nested_function,
+        )
         self.assertNotIn("compact_vision_tool_value", nested_function)
+
+        table_function = next(
+            ast.get_source_segment(r_group_source, node)
+            for node in ast.parse(r_group_source).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "process_reaction_image_with_table_R_group"
+        )
+        self.assertNotIn("original_reactant.get('symbols'", table_function)
+        self.assertNotIn("original_reactant.get('smiles'", table_function)
+        self.assertNotIn("original_product.get('symbols'", table_function)
+        self.assertNotIn("original_product.get('smiles'", table_function)
 
     def test_all_molecular_agent_variants_use_request_scoped_raw_cache(self):
         source = (ROOT / "get_molecular_agent.py").read_text(encoding="utf-8")
@@ -402,7 +437,7 @@ class ImportAndOrchestrationTests(unittest.TestCase):
                     function_source,
                 )
 
-    def test_reaction_template_tools_deliver_retried_rxnim_prediction(self):
+    def test_reaction_template_tools_do_not_expose_raw_rxnim_prediction(self):
         source = (ROOT / "get_R_group_sub_agent.py").read_text(encoding="utf-8")
         functions = {
             node.name: ast.get_source_segment(source, node)
@@ -415,11 +450,10 @@ class ImportAndOrchestrationTests(unittest.TestCase):
         ):
             with self.subTest(variant=variant):
                 function_source = functions[variant]
-                self.assertIn(
-                    "_predict_reaction_with_empty_retries",
+                self.assertNotIn(
+                    '"reaction_prediction": raw_prediction',
                     function_source,
                 )
-                self.assertIn('"reaction_prediction": raw_prediction', function_source)
                 self.assertNotIn("model1.predict_image_file", function_source)
 
     def test_product_variant_agent_handles_empty_reaction_prediction(self):

@@ -383,6 +383,19 @@ class CodexAppServerClient:
         # Tool handlers may invoke another ChemEAGLE LLM agent using this same
         # connection. Never block the sole JSONL reader while such nested RPCs
         # are waiting for responses.
+        if message.get("method") == "item/tool/call":
+            params = message.get("params") or {}
+            self._record_tool_trace(
+                str(params.get("turnId") or ""),
+                {
+                    "call_id": str(params.get("callId") or ""),
+                    "name": str(params.get("tool") or ""),
+                    "arguments": params.get("arguments"),
+                    "output": None,
+                    "supplemental_content": [],
+                    "success": None,
+                },
+            )
         threading.Thread(
             target=self._handle_server_request_sync,
             args=(message,),
@@ -425,22 +438,40 @@ class CodexAppServerClient:
         tool_name = params.get("tool")
         handler = executor.get(tool_name) if executor is not None else None
         if handler is None:
+            failure = f"Unknown or disallowed tool: {tool_name}"
+            self._complete_tool_trace(
+                str(params.get("turnId") or ""),
+                str(params.get("callId") or ""),
+                output=failure,
+                supplemental_content=[],
+                success=False,
+            )
             self._send_result(
                 request_id,
-                tool_result(f"Unknown or disallowed tool: {tool_name}", success=False),
+                tool_result(failure, success=False),
             )
             _trace(f"tool/result-sent name={tool_name} success=false reason=unknown-tool")
             return
         arguments = params.get("arguments")
         if not isinstance(arguments, dict):
+            failure = "Tool arguments must be a JSON object"
+            self._complete_tool_trace(
+                str(params.get("turnId") or ""),
+                str(params.get("callId") or ""),
+                output=failure,
+                supplemental_content=[],
+                success=False,
+            )
             self._send_result(
                 request_id,
-                tool_result("Tool arguments must be a JSON object", success=False),
+                tool_result(failure, success=False),
             )
             _trace(f"tool/result-sent name={tool_name} success=false reason=invalid-arguments")
             return
         started_at = time.monotonic()
         _trace(f"tool/start name={tool_name}")
+        turn_id = str(params.get("turnId") or "")
+        call_id = str(params.get("callId") or "")
         try:
             result = handler(**arguments)
             supplemental_content = []
@@ -452,25 +483,31 @@ class CodexAppServerClient:
                 f"tool/complete name={tool_name} elapsed={time.monotonic() - started_at:.3f}s "
                 f"payload_chars={len(text)}"
             )
-            self._send_result(
-                request_id,
-                tool_result(
-                    text,
-                    success=True,
-                    supplemental_content=supplemental_content,
-                ),
+            self._complete_tool_trace(
+                turn_id,
+                call_id,
+                output=text,
+                supplemental_content=supplemental_content,
+                success=True,
             )
+            self._send_result(request_id, tool_result(text, success=True))
             _trace(f"tool/result-sent name={tool_name} success=true")
         except Exception as exc:
+            failure = f"Tool failed: {type(exc).__name__}: {exc}"
+            self._complete_tool_trace(
+                turn_id,
+                call_id,
+                output=failure,
+                supplemental_content=[],
+                success=False,
+            )
             _trace(
                 f"tool/error name={tool_name} elapsed={time.monotonic() - started_at:.3f}s "
                 f"type={type(exc).__name__}"
             )
             self._send_result(
                 request_id,
-                tool_result(
-                    f"Tool failed: {type(exc).__name__}: {exc}", success=False
-                ),
+                tool_result(failure, success=False),
             )
             _trace(f"tool/result-sent name={tool_name} success=false reason=tool-error")
 
@@ -479,8 +516,54 @@ class CodexAppServerClient:
         with self._turn_activity_lock:
             self._turn_activity.setdefault(
                 turn_id,
-                {"active_tools": 0, "active_since": None, "last_activity": now},
+                {
+                    "active_tools": 0,
+                    "active_since": None,
+                    "last_activity": now,
+                    "tool_trace": [],
+                },
             )
+
+    def _record_tool_trace(self, turn_id: str, entry: Dict[str, Any]) -> None:
+        if not turn_id:
+            return
+        now = time.monotonic()
+        with self._turn_activity_lock:
+            state = self._turn_activity.setdefault(
+                turn_id,
+                {
+                    "active_tools": 0,
+                    "active_since": None,
+                    "last_activity": now,
+                    "tool_trace": [],
+                },
+            )
+            state.setdefault("tool_trace", []).append(entry)
+            state["last_activity"] = now
+
+    def _complete_tool_trace(
+        self,
+        turn_id: str,
+        call_id: str,
+        *,
+        output: str,
+        supplemental_content: List[Dict[str, Any]],
+        success: bool,
+    ) -> None:
+        if not turn_id:
+            return
+        now = time.monotonic()
+        with self._turn_activity_lock:
+            state = self._turn_activity.get(turn_id)
+            if state is None:
+                return
+            for entry in reversed(state.get("tool_trace") or []):
+                if entry.get("call_id") == call_id:
+                    entry["output"] = output
+                    entry["supplemental_content"] = supplemental_content
+                    entry["success"] = success
+                    break
+            state["last_activity"] = now
 
     def _mark_notification_activity(self, message: Dict[str, Any]) -> None:
         """Reset a turn's silence window when App Server reports progress."""
@@ -498,7 +581,12 @@ class CodexAppServerClient:
         with self._turn_activity_lock:
             state = self._turn_activity.setdefault(
                 str(turn_id),
-                {"active_tools": 0, "active_since": None, "last_activity": now},
+                {
+                    "active_tools": 0,
+                    "active_since": None,
+                    "last_activity": now,
+                    "tool_trace": [],
+                },
             )
             state["last_activity"] = now
 
@@ -509,7 +597,12 @@ class CodexAppServerClient:
         with self._turn_activity_lock:
             state = self._turn_activity.setdefault(
                 turn_id,
-                {"active_tools": 0, "active_since": None, "last_activity": now},
+                {
+                    "active_tools": 0,
+                    "active_since": None,
+                    "last_activity": now,
+                    "tool_trace": [],
+                },
             )
             if not state["active_tools"]:
                 state["active_since"] = now
@@ -541,9 +634,10 @@ class CodexAppServerClient:
                 state["active_since"],
             )
 
-    def clear_turn_activity(self, turn_id: str) -> None:
+    def clear_turn_activity(self, turn_id: str) -> List[Dict[str, Any]]:
         with self._turn_activity_lock:
-            self._turn_activity.pop(turn_id, None)
+            state = self._turn_activity.pop(turn_id, None) or {}
+        return list(state.get("tool_trace") or [])
 
     def account(self, *, refresh: bool = False) -> Dict[str, Any]:
         return self.request("account/read", {"refreshToken": refresh})
@@ -612,39 +706,143 @@ class CodexAppServerClient:
                             pass
 
 
-def _messages_to_codex_input(messages: Iterable[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+def _inline_image_url(part: Dict[str, Any]) -> str:
+    image = part.get("image_url")
+    url = image.get("url") if isinstance(image, dict) else image
+    if not isinstance(url, str) or not url.startswith("data:image/"):
+        raise UnsupportedCapabilityError(
+            "Codex image inputs must be inline data:image/... URLs"
+        )
+    return url
+
+
+def _message_content_items(role: str, content: Any) -> List[Dict[str, Any]]:
+    output = role == "assistant"
+    text_type = "output_text" if output else "input_text"
+    items: List[Dict[str, Any]] = []
+    if isinstance(content, str):
+        items.append({"type": text_type, "text": content})
+    elif isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in {"text", "input_text", "output_text"}:
+                items.append({"type": text_type, "text": str(part.get("text", ""))})
+            elif part.get("type") in {"image_url", "input_image"}:
+                if output:
+                    raise UnsupportedCapabilityError(
+                        "Assistant history cannot contain input images"
+                    )
+                items.append(
+                    {"type": "input_image", "image_url": _inline_image_url(part)}
+                )
+    return items
+
+
+def _message_to_turn_inputs(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+    inputs: List[Dict[str, Any]] = []
+    content = message.get("content")
+    if isinstance(content, str):
+        inputs.append({"type": "text", "text": content})
+    elif isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in {"text", "input_text"}:
+                inputs.append({"type": "text", "text": str(part.get("text", ""))})
+            elif part.get("type") in {"image_url", "input_image"}:
+                inputs.append({"type": "image", "url": _inline_image_url(part)})
+    return inputs
+
+
+def _message_to_response_items(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+    role = str(message.get("role", "user"))
+    if role == "tool":
+        call_id = message.get("tool_call_id")
+        if not isinstance(call_id, str) or not call_id:
+            raise UnsupportedCapabilityError(
+                "Tool history requires a non-empty tool_call_id"
+            )
+        content = message.get("content")
+        output = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+        return [
+            {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            }
+        ]
+
+    if role not in {"user", "assistant"}:
+        raise UnsupportedCapabilityError(
+            f"Unsupported Codex conversation-history role: {role!r}"
+        )
+    items: List[Dict[str, Any]] = []
+    content_items = _message_content_items(role, message.get("content"))
+    if content_items:
+        items.append({"type": "message", "role": role, "content": content_items})
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") if isinstance(call, dict) else None
+        call_id = call.get("id") if isinstance(call, dict) else None
+        if not isinstance(function, dict) or not isinstance(call_id, str) or not call_id:
+            raise UnsupportedCapabilityError(
+                "Assistant tool-call history requires id and function fields"
+            )
+        name = function.get("name")
+        arguments = function.get("arguments", "{}")
+        if not isinstance(name, str) or not name:
+            raise UnsupportedCapabilityError(
+                "Assistant tool-call history requires a function name"
+            )
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        items.append(
+            {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+            }
+        )
+    return items
+
+
+def _messages_to_codex_context(
+    messages: Iterable[Dict[str, Any]],
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
     system_parts: List[str] = []
-    text_parts: List[str] = []
-    images: List[Dict[str, Any]] = []
+    conversation: List[Dict[str, Any]] = []
     for message in messages:
         role = str(message.get("role", "user"))
-        content = message.get("content")
-        destination = system_parts if role in {"system", "developer"} else text_parts
-        if isinstance(content, str):
-            destination.append(f"[{role}]\n{content}")
-        elif isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") in {"text", "input_text"}:
-                    destination.append(f"[{role}]\n{part.get('text', '')}")
-                elif part.get("type") in {"image_url", "input_image"}:
-                    image = part.get("image_url")
-                    url = image.get("url") if isinstance(image, dict) else part.get("image_url")
-                    if not isinstance(url, str) or not url.startswith("data:image/"):
-                        raise UnsupportedCapabilityError(
-                            "Codex image inputs must be inline data:image/... URLs"
-                        )
-                    images.append({"type": "image", "url": url})
-        tool_calls = message.get("tool_calls")
-        if tool_calls:
-            text_parts.append(
-                f"[{role} tool calls]\n{json.dumps(tool_calls, ensure_ascii=False)}"
-            )
-    if not text_parts:
-        text_parts.append("[user]\nComplete the requested ChemEAGLE inference task.")
-    inputs = [{"type": "text", "text": "\n\n".join(text_parts)}, *images]
-    return "\n\n".join(system_parts), inputs
+        if role in {"system", "developer"}:
+            content = message.get("content")
+            if isinstance(content, str):
+                system_parts.append(content)
+            elif isinstance(content, list):
+                system_parts.extend(
+                    str(part.get("text", ""))
+                    for part in content
+                    if isinstance(part, dict)
+                    and part.get("type") in {"text", "input_text"}
+                )
+            continue
+        conversation.append(message)
+
+    # Consecutive user messages at the end belong to the current turn. Every
+    # earlier role is injected as a native Responses item, preserving assistant
+    # function calls and function-call outputs without textual role labels.
+    split = len(conversation)
+    while split > 0 and conversation[split - 1].get("role", "user") == "user":
+        split -= 1
+    history_messages = conversation[:split]
+    current_messages = conversation[split:]
+    history_items: List[Dict[str, Any]] = []
+    for message in history_messages:
+        history_items.extend(_message_to_response_items(message))
+    turn_inputs: List[Dict[str, Any]] = []
+    for message in current_messages:
+        turn_inputs.extend(_message_to_turn_inputs(message))
+    return "\n\n".join(system_parts), history_items, turn_inputs
 
 
 def _rate_limit_reached(payload: Dict[str, Any]) -> Optional[str]:
@@ -814,7 +1012,9 @@ class CodexAppServerBackend(BaseLLMBackend):
             raise BackendCancelledError("Codex request was cancelled")
         self.client.start()
         self._require_subscription()
-        system_text, inputs = _messages_to_codex_input(request.messages)
+        system_text, history_items, inputs = _messages_to_codex_context(
+            request.messages
+        )
         instructions = (
             "You are the language-model reasoning backend inside ChemEAGLE, a chemical "
             "information-extraction pipeline. Do not inspect files, execute shell commands, "
@@ -853,8 +1053,17 @@ class CodexAppServerBackend(BaseLLMBackend):
                     )
                 model = started_thread.get("model") or selected_model
                 self._record_resolved_model(model)
+                if history_items:
+                    self.client.request(
+                        "thread/inject_items",
+                        {
+                            "threadId": str(new_thread_id),
+                            "items": history_items,
+                        },
+                    )
                 _trace(
-                    f"thread/start id={new_thread_id} model={model or 'default'}"
+                    f"thread/start id={new_thread_id} model={model or 'default'} "
+                    f"history_items={len(history_items)}"
                 )
                 return started_thread, str(new_thread_id), model
 
@@ -898,6 +1107,7 @@ class CodexAppServerBackend(BaseLLMBackend):
                     f"tools={len(tools or [])} timeout={request.timeout or self.config.timeout:g}s"
                 )
                 try:
+                    tool_trace: List[Dict[str, Any]] = []
                     completed = self._wait_for_turn(
                         thread_id=thread_id,
                         turn_id=turn_id,
@@ -931,7 +1141,7 @@ class CodexAppServerBackend(BaseLLMBackend):
                     )
                     raise
                 finally:
-                    self.client.clear_turn_activity(turn_id)
+                    tool_trace = self.client.clear_turn_activity(turn_id)
                 turn = (completed.get("params") or {}).get("turn") or {}
                 status = turn.get("status")
                 _trace(
@@ -961,7 +1171,11 @@ class CodexAppServerBackend(BaseLLMBackend):
                 response = LLMResponse(
                     content=agent_messages[-1],
                     model=resolved_model,
-                    metadata={"thread_id": thread_id, "turn_id": turn.get("id")},
+                    metadata={
+                        "thread_id": thread_id,
+                        "turn_id": turn.get("id"),
+                        "tool_trace": tool_trace,
+                    },
                 )
                 if request.json_mode or request.output_schema:
                     try:
@@ -1032,7 +1246,7 @@ class CodexAppServerBackend(BaseLLMBackend):
             for name, handler in executor.items()
             if name in schemas
         }
-        return self._run(
+        first = self._run(
             replace(
                 request,
                 tools=[],
@@ -1040,6 +1254,78 @@ class CodexAppServerBackend(BaseLLMBackend):
             ),
             tools=tools,
             executor=validated_executor,
+        )
+        trace = getattr(first, "metadata", {}).get("tool_trace") or []
+        supplemental_content = list(request.tool_followup_content)
+        failed_trace = [entry for entry in trace if entry.get("success") is False]
+        if supplemental_content and failed_trace:
+            failed = failed_trace[0]
+            raise ToolExecutionError(
+                "Codex dynamic tool failed during the upstream-compatible "
+                f"first completion: {failed.get('name')}: {failed.get('output')}"
+            )
+        if not supplemental_content:
+            for entry in trace:
+                supplemental_content.extend(
+                    entry.get("supplemental_content") or []
+                )
+        if not supplemental_content:
+            return first
+
+        # The upstream product-variant R-group agent performs two completions.
+        # Its second message list contains the annotated user image first,
+        # followed by the assistant's native function calls and the matching
+        # function-call outputs. Rebuild that history rather than placing the
+        # annotation inside a tool result or flattening roles into prose.
+        messages = [
+            message
+            for message in request.messages
+            if message.get("role") in {"system", "developer"}
+        ]
+        messages.append({"role": "user", "content": supplemental_content})
+        if trace:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": entry["call_id"],
+                            "type": "function",
+                            "function": {
+                                "name": entry["name"],
+                                "arguments": json.dumps(
+                                    entry.get("arguments") or {},
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                        for entry in trace
+                        if entry.get("call_id") and entry.get("name")
+                    ],
+                }
+            )
+        else:
+            messages.append(first.assistant_message())
+        messages.extend(
+            {
+                "role": "tool",
+                "name": entry["name"],
+                "tool_call_id": entry["call_id"],
+                "content": str(entry.get("output") or ""),
+            }
+            for entry in trace
+            if entry.get("call_id") and entry.get("name")
+        )
+        return self.generate(
+            replace(
+                request,
+                messages=messages,
+                tools=[],
+                tool_choice=None,
+                tool_followup_content=[],
+                timeout=request.timeout or self.config.timeout,
+            )
         )
 
     def close(self) -> None:

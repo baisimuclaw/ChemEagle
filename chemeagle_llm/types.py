@@ -56,9 +56,9 @@ class LLMToolOutput:
     """A tool value plus multimodal evidence for the model's continuation.
 
     ``value`` remains the machine-readable function result.  Supplemental
-    content is delivered after the tool result (or as Codex dynamic-tool
-    content items), so agents can inspect an annotated image without rerunning
-    the underlying vision model.
+    content becomes the annotated user message in the upstream-compatible
+    second completion, so agents can inspect the marked image without
+    rerunning the underlying vision model.
     """
 
     value: Any
@@ -76,6 +76,7 @@ class LLMRequest:
     temperature: Optional[float] = None
     timeout: Optional[float] = None
     cancel_event: Optional[Any] = None
+    tool_followup_content: List[Dict[str, Any]] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)
 
 

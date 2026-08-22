@@ -39,27 +39,8 @@ def openai_tools_to_dynamic(
     return dynamic
 
 
-def tool_result(
-    text: str,
-    *,
-    success: bool,
-    supplemental_content: Iterable[Dict[str, Any]] = (),
-) -> Dict[str, Any]:
-    content_items = [{"type": "inputText", "text": text}]
-    for item in supplemental_content:
-        item_type = item.get("type")
-        if item_type == "text" and isinstance(item.get("text"), str):
-            content_items.append({"type": "inputText", "text": item["text"]})
-        elif item_type == "image_url":
-            image_url = item.get("image_url")
-            url = image_url.get("url") if isinstance(image_url, dict) else image_url
-            if not isinstance(url, str):
-                raise UnsupportedCapabilityError(
-                    "Supplemental tool images require a string image URL"
-                )
-            content_items.append({"type": "inputImage", "imageUrl": url})
-        else:
-            raise UnsupportedCapabilityError(
-                f"Unsupported supplemental tool content type: {item_type!r}"
-            )
-    return {"contentItems": content_items, "success": success}
+def tool_result(text: str, *, success: bool) -> Dict[str, Any]:
+    return {
+        "contentItems": [{"type": "inputText", "text": text}],
+        "success": success,
+    }

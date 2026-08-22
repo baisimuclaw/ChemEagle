@@ -22,7 +22,7 @@ from chemeagle_llm.errors import (
     BackendTimeoutError,
     UnsupportedCapabilityError,
 )
-from chemeagle_llm.types import LLMRequest, LLMToolOutput
+from chemeagle_llm.types import LLMRequest, LLMResponse, LLMToolOutput
 
 
 class _QueueStream:
@@ -108,6 +108,7 @@ class _CodexScript:
         self.turn_input = None
         self.turn_inputs = []
         self.output_schema = None
+        self.injected_histories = []
 
     def send(self, message):
         self.process.stdout.put(message)
@@ -224,6 +225,9 @@ class _CodexScript:
                 message,
                 {"thread": {"id": "thread-1"}, "model": "available-model"},
             )
+        elif method == "thread/inject_items":
+            self.injected_histories.append(message["params"]["items"])
+            self.response(message, {})
         elif method == "turn/start":
             self.turn_count += 1
             turn_id = f"turn-{self.turn_count}"
@@ -310,6 +314,41 @@ class CodexBackendTests(unittest.TestCase):
             )
         self.assertIs(result, mock.sentinel.response)
         self.assertEqual(run.call_args.args[0].timeout, 5)
+
+    def test_no_tool_call_still_uses_upstream_annotated_followup(self):
+        config = BackendConfig(
+            provider="codex", model="available-model", timeout=5
+        )
+        backend = CodexAppServerBackend(config, client=mock.Mock())
+        preliminary = LLMResponse(content='{"preliminary": true}')
+        final = LLMResponse(content='{"final": true}')
+        request = LLMRequest(
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "original image"},
+            ],
+            json_mode=True,
+            tool_followup_content=[
+                {"type": "text", "text": "same prompt"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,ANNOTATED"},
+                },
+            ],
+        )
+        with mock.patch.object(
+            backend, "_run", side_effect=[preliminary, final]
+        ) as run:
+            response = backend.run_tool_loop(request, [], {})
+
+        self.assertIs(response, final)
+        followup = run.call_args_list[1].args[0]
+        self.assertEqual(
+            [message["role"] for message in followup.messages],
+            ["system", "user", "assistant"],
+        )
+        self.assertEqual(followup.messages[1]["content"][0]["text"], "same prompt")
+        self.assertEqual(followup.messages[2]["content"], preliminary.content)
 
     def test_non_tool_server_requests_remain_safely_denied(self):
         client = CodexAppServerClient(
@@ -685,7 +724,7 @@ class CodexBackendTests(unittest.TestCase):
         finally:
             backend.close()
 
-    def test_dynamic_tool_can_return_annotated_image_evidence(self):
+    def test_dynamic_tool_rebuilds_upstream_annotated_second_completion(self):
         backend, script = self.make_backend()
         try:
             backend.run_tool_loop(
@@ -716,22 +755,92 @@ class CodexBackendTests(unittest.TestCase):
                     )
                 },
             )
+            self.assertEqual(script.thread_count, 2)
+            self.assertEqual(script.turn_count, 2)
             self.assertEqual(
                 script.dynamic_reply["contentItems"],
+                [{"type": "inputText", "text": '{"molecule": "CC"}'}],
+            )
+            self.assertEqual(script.turn_inputs[-1], [])
+            injected = script.injected_histories[-1]
+            self.assertEqual(injected[0]["type"], "message")
+            self.assertEqual(injected[0]["role"], "user")
+            self.assertEqual(
+                injected[0]["content"],
                 [
                     {
-                        "type": "inputText",
-                        "text": '{"molecule": "CC"}',
-                    },
-                    {
-                        "type": "inputImage",
-                        "imageUrl": "data:image/png;base64,AAAA",
-                    },
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AAAA",
+                    }
                 ],
             )
+            self.assertEqual(injected[1]["type"], "function_call")
+            self.assertEqual(injected[1]["call_id"], "call-1")
+            self.assertEqual(injected[2]["type"], "function_call_output")
+            self.assertEqual(injected[2]["call_id"], "call-1")
+            self.assertEqual(injected[2]["output"], '{"molecule": "CC"}')
             self.assertEqual(
                 backend.runtime_metadata()["resolved_models"],
                 ["available-model"],
+            )
+        finally:
+            backend.close()
+
+    def test_existing_tool_history_is_injected_with_native_response_roles(self):
+        backend, script = self.make_backend()
+        try:
+            response = backend.generate(
+                LLMRequest(
+                    messages=[
+                        {"role": "system", "content": "Return chemistry JSON."},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Read figure"},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": "data:image/png;base64,AAAA"
+                                    },
+                                },
+                            ],
+                        },
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "agent-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "reaction_agent",
+                                        "arguments": '{"image_path":"figure.png"}',
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "agent-1",
+                            "name": "reaction_agent",
+                            "content": '{"reactants":["CC"]}',
+                        },
+                    ],
+                    json_mode=True,
+                )
+            )
+            self.assertEqual(json.loads(response.content), {"reactions": []})
+            self.assertEqual(script.turn_input, [])
+            self.assertEqual(
+                [item["type"] for item in script.injected_histories[0]],
+                ["message", "function_call", "function_call_output"],
+            )
+            self.assertEqual(
+                script.injected_histories[0][0]["content"][1],
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,AAAA",
+                },
             )
         finally:
             backend.close()

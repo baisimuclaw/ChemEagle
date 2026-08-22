@@ -33,8 +33,9 @@ def _predict_reaction_with_empty_retries(
 ):
     """Retry RxnIM only when inference succeeds but detects no reaction.
 
-    Exceptions deliberately propagate unchanged.  After the final empty result,
-    return an empty list so the existing image-aware LLM fallback can continue.
+    Exceptions deliberately propagate unchanged. After the final empty result,
+    return an empty list so downstream agents omit the reaction instead of
+    substituting an image-only LLM guess.
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
@@ -55,7 +56,7 @@ def _predict_reaction_with_empty_retries(
 
     print(
         "Warning: RxnIM returned no reaction after "
-        f"{max_attempts} attempts; continuing with the LLM image fallback."
+        f"{max_attempts} attempts; the reaction will be omitted."
     )
     return []
 
@@ -281,7 +282,10 @@ def get_reaction_withatoms(image_path: str) -> dict:
 
         return input2
     
-    raw_reaction = input2[0] if input2 else gpt_output
+    if not input2:
+        print("Warning: no RxnIM reaction available; omitting the reaction result.")
+        return []
+    raw_reaction = input2[0]
     updated_data = [update_input_with_symbols(gpt_output, raw_reaction, _convert_graph_to_smiles)]
 
     return updated_data
@@ -413,7 +417,10 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
 
         return input2
     
-    raw_reaction = input2[0] if input2 else gpt_output
+    if not input2:
+        print("Warning: no RxnIM reaction available; omitting the reaction result.")
+        return []
+    raw_reaction = input2[0]
     updated_data = [update_input_with_symbols(gpt_output, raw_reaction, _convert_graph_to_smiles)]
     updated_data = _patch_to_reaction(updated_data)
     print(f"rxn_agent_output:{updated_data}")
@@ -548,7 +555,10 @@ def get_reaction_withatoms_correctR_OS(
 
         return input2
     
-    raw_reaction = input2[0] if input2 else gpt_output
+    if not input2:
+        print("Warning: no RxnIM reaction available; omitting the reaction result.")
+        return []
+    raw_reaction = input2[0]
     updated_data = [update_input_with_symbols(gpt_output, raw_reaction, _convert_graph_to_smiles)]
     updated_data = _patch_to_reaction(updated_data)
     print(f"rxn_agent_output:{updated_data}")

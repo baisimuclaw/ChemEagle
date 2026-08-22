@@ -230,6 +230,11 @@ def _run_image_tool_agent_with_results(
     result_messages = []
     result_lock = threading.Lock()
     supplemental_sent = False
+    followup_content = (
+        supplemental_content_factory()
+        if supplemental_content_factory is not None
+        else []
+    )
 
     def bind(name, handler):
         caller_context = copy_context()
@@ -243,15 +248,12 @@ def _run_image_tool_agent_with_results(
                     return handler(image_path)
 
             value = caller_context.copy().run(run_handler)
-            llm_value = value
+            llm_value = {"image_path": image_path, name: value}
             message = {
                 "role": "tool",
                 "name": name,
                 "tool_call_id": f"executed-{name}",
-                "content": json.dumps(
-                    {"image_path": image_path, name: llm_value},
-                    ensure_ascii=False,
-                ),
+                "content": json.dumps(llm_value, ensure_ascii=False),
             }
             with result_lock:
                 cache[name] = value
@@ -265,7 +267,7 @@ def _run_image_tool_agent_with_results(
             if attach_supplement:
                 return LLMToolOutput(
                     value=llm_value,
-                    supplemental_content=supplemental_content_factory(),
+                    supplemental_content=copy.deepcopy(followup_content),
                 )
             return llm_value
 
@@ -283,6 +285,7 @@ def _run_image_tool_agent_with_results(
                 json_mode=True,
                 temperature=0,
                 tool_choice="auto",
+                tool_followup_content=copy.deepcopy(followup_content),
             ),
             tools,
             executor,
@@ -1002,7 +1005,6 @@ def get_full_reaction_template(image_path: str) -> dict:
     parsed = parse_coref_data_with_fallback(data)
 
     combined_result = {
-        "reaction_prediction": raw_prediction,  # compacted before LLM delivery
         "molecule_coref": parsed               # structured molecule recognition result
     }
     print(f"combined_result:{combined_result}")
@@ -1044,7 +1046,6 @@ def get_full_reaction_template_OS(image_path: str) -> dict:
     parsed = parse_coref_data_with_fallback(data)
 
     combined_result = {
-        "reaction_prediction": raw_prediction,  # compacted before LLM delivery
         "molecule_coref": parsed               # structured molecule recognition result
     }
     print(f"combined_result:{combined_result}")
@@ -1180,10 +1181,7 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
                 annotated_content_cache = [
                     {
                         "type": "text",
-                        "text": (
-                            "Use this annotated copy of the original figure to align "
-                            "molecule bounding-box IDs, labels, and R-group assignments."
-                        ),
+                        "text": prompt,
                     },
                     {
                         "type": "image_url",
@@ -1217,30 +1215,6 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
         },
         supplemental_content_factory=lambda: copy.deepcopy(annotated_content),
     )
-    if not results:
-        # ``tool_choice=auto`` may legitimately return no call.  The official
-        # implementation still performs a second annotated-image pass in that
-        # case, so preserve that behavior rather than accepting an answer that
-        # never saw the molecule IDs.
-        with backend_scope(backend):
-            review_response = backend.generate(
-                LLMRequest(
-                    model=backend_model(backend, "gpt-5-mini"),
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                *copy.deepcopy(annotated_content),
-                            ],
-                        },
-                    ],
-                    json_mode=True,
-                    temperature=0,
-                )
-            )
-        gpt_output = parse_json_content(review_response)
     print("R_group_agent_output:", gpt_output)
     gpt_output = _compensate_missing_molecules(gpt_output, results, 'get_multi_molecular_text_to_correct')
     image = Image.open(image_path).convert('RGB')
@@ -1647,12 +1621,14 @@ def process_reaction_image_with_table_R_group(image_path: str) -> dict:
                 else:
                     # If molecule type, get corresponding symbols from reaction['reactants']
                     reaction_reactants = reaction.get('reactants', [])
-                    reactant = (
-                        reaction_reactants[mol_idx]
-                        if mol_idx < len(reaction_reactants)
-                        and isinstance(reaction_reactants[mol_idx], dict)
-                        else {}
-                    )
+                    if (
+                        mol_idx >= len(reaction_reactants)
+                        or not isinstance(reaction_reactants[mol_idx], dict)
+                    ):
+                        # Match upstream precision-first behavior: an omitted
+                        # LLM correction means this molecule is omitted too.
+                        continue
+                    reactant = reaction_reactants[mol_idx]
                     mol_idx += 1
 
                     new_symbols_reactant = reactant.get('symbols')
@@ -1660,11 +1636,8 @@ def process_reaction_image_with_table_R_group(image_path: str) -> dict:
                         not isinstance(new_symbols_reactant, list)
                         or len(new_symbols_reactant) != len(original_reactant['coords'])
                     ):
-                        new_symbols_reactant = original_reactant.get('symbols', [])
-                    if len(new_symbols_reactant) == len(original_reactant['coords']):
-                        new_smiles_reactant, __, __ = _convert_graph_to_smiles(original_reactant['coords'], new_symbols_reactant, original_reactant['edges'])  # generate new SMILES
-                    else:
-                        new_smiles_reactant = original_reactant.get('smiles', '')
+                        continue
+                    new_smiles_reactant, __, __ = _convert_graph_to_smiles(original_reactant['coords'], new_symbols_reactant, original_reactant['edges'])  # generate new SMILES
 
                     new_reactant = {
                         #"category": original_reactant['category'],
@@ -1696,12 +1669,14 @@ def process_reaction_image_with_table_R_group(image_path: str) -> dict:
                 else:
                     # If molecule type, get corresponding symbols from reaction['products']
                     reaction_products = reaction.get('products', [])
-                    product = (
-                        reaction_products[mol_idx]
-                        if mol_idx < len(reaction_products)
-                        and isinstance(reaction_products[mol_idx], dict)
-                        else {}
-                    )
+                    if (
+                        mol_idx >= len(reaction_products)
+                        or not isinstance(reaction_products[mol_idx], dict)
+                    ):
+                        # Match upstream precision-first behavior: do not emit
+                        # the uncorrected visual-model product as a fallback.
+                        continue
+                    product = reaction_products[mol_idx]
                     mol_idx += 1
 
                     new_symbols_product = product.get('symbols')
@@ -1709,11 +1684,8 @@ def process_reaction_image_with_table_R_group(image_path: str) -> dict:
                         not isinstance(new_symbols_product, list)
                         or len(new_symbols_product) != len(original_product['coords'])
                     ):
-                        new_symbols_product = original_product.get('symbols', [])
-                    if len(new_symbols_product) == len(original_product['coords']):
-                        new_smiles_product, __, __ = _convert_graph_to_smiles(original_product['coords'], new_symbols_product, original_product['edges'])  # generate new SMILES
-                    else:
-                        new_smiles_product = original_product.get('smiles', '')
+                        continue
+                    new_smiles_product, __, __ = _convert_graph_to_smiles(original_product['coords'], new_symbols_product, original_product['edges'])  # generate new SMILES
 
                     new_product = {
                         #"category": original_product['category'],
